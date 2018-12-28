@@ -2826,7 +2826,7 @@ static void zram_owner_log(struct zram *zram, const char *op,
 	pr_info("ZRAM_OWNER_DIAG op=%s phase=%s dev=%s pid=%d tgid=%d comm=%s ppid=%d pcomm=%s actual=%llu old=%llu new=%llu totalram=%llu rc=%zd request=%.*s\n",
 		op, phase, zram->disk->disk_name, task_pid_nr(current),
 		task_tgid_nr(current), comm, ppid, pcomm, actual, old_size,
-		READ_ONCE(zram->disksize), (u64)totalram_pages << PAGE_SHIFT, rc,
+		READ_ONCE(zram->disksize), (u64)totalram_pages() << PAGE_SHIFT, rc,
 		(int)min_t(size_t, len, 64), buf);
 }
 
@@ -2847,7 +2847,7 @@ static ssize_t disksize_store(struct device *dev,
 	}
 #ifdef CONFIG_ZRAM_HARDCODE_DISKSIZE
 	/* 内核级 ZRAM 1:1：容量取物理内存大小，写 sysfs 的值仍被忽略 */
-	disksize = (u64)totalram_pages << PAGE_SHIFT;
+	disksize = (u64)totalram_pages() << PAGE_SHIFT;
 #else
 	disksize = memparse(buf, NULL);
 #endif
