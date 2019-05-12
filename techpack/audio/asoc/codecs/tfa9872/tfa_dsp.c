@@ -106,7 +106,7 @@ TFA_INTERNAL struct tfa98xx_handle_private handles_local[MAX_HANDLES];
 /* calibration done executed */
 #define TFA_MTPEX_POS	TFA98XX_KEY2_PROTECTED_MTP0_MTPEX_POS /**/
 
-static enum tfa_error _tfa_stop(tfa98xx_handle_t handle);
+static enum tfa98xx_error _tfa_stop(tfa98xx_handle_t handle);
 
 /*
  * static variables
@@ -161,6 +161,20 @@ static void tfa_msg32to24(
 	}
 }
 #endif // (TFADSP_32BITS)
+
+enum tfa_error tfa98xxTotfa(enum tfa98xx_error err)
+{
+	switch(err) {
+	case TFA98XX_ERROR_OK:
+		return tfa_error_ok;
+	case TFA98XX_ERROR_DEVICE:
+		return tfa_error_device;
+	case TFA98XX_ERROR_BAD_PARAMETER:
+		return tfa_error_bad_param;
+	default:
+		return tfa_error_bad_param;
+	}
+}
 
 TFA_INTERNAL int tfa98xx_handle_is_open(tfa98xx_handle_t h)
 {
@@ -4402,7 +4416,7 @@ tfa_run_wait_calibration(tfa98xx_handle_t handle, int *calibrate_done)
 	return err;
 }
 
-static enum tfa_error _tfa_stop(tfa98xx_handle_t handle)
+static enum tfa98xx_error _tfa_stop(tfa98xx_handle_t handle)
 {
 	enum tfa98xx_error err = TFA98XX_ERROR_OK;
 
@@ -4651,7 +4665,7 @@ enum tfa_error tfa_start(int next_profile, int *vstep)
 		tfa_cont_close(dev); /* close all of them */
 	}
 
-	return err;
+	return tfa98xxTotfa(err);
 
 error_exit:
 	if (dev < devcount)
@@ -4677,7 +4691,7 @@ error_exit:
 
 	}
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 enum tfa_error tfa_stop(void)
@@ -4714,7 +4728,7 @@ error_exit:
 	for (dev = 0; dev < devcount; dev++)
 		tfa_cont_close(dev); /* close all of them */
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 /*
@@ -4749,7 +4763,7 @@ int tfa98xx_reset(tfa98xx_handle_t handle)
 		PRINT_ASSERT(err);
 	}
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 enum tfa_error tfa_reset(void)
@@ -4772,7 +4786,7 @@ enum tfa_error tfa_reset(void)
 		tfa_cont_close(dev);
 	}
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 /*

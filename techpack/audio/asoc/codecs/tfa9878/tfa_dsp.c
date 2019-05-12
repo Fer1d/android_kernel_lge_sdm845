@@ -81,10 +81,54 @@ static int dsp_cal_value[MAX_HANDLES] = {-1, -1, -1, -1};
 
 static enum tfa98xx_error tfa_process_re25(struct tfa_device *tfa);
 
+enum tfa_error tfa98xxTotfa(enum tfa98xx_error err)
+{
+	switch(err) {
+	case TFA98XX_ERROR_OK:
+		return tfa_error_ok;
+	case TFA98XX_ERROR_DEVICE:
+		return tfa_error_device;
+	case TFA98XX_ERROR_BAD_PARAMETER:
+		return tfa_error_bad_param;
+	default:
+		return tfa_error_bad_param;
+	}
+}
+
 int tfa_get_calibration_info(struct tfa_device *tfa, int channel)
 {
 	return tfa->mohm[channel];
 }
+
+#if defined(MPLATFORM)
+static void tfa_wait_cal_work(struct work_struct *work)
+{
+	struct tfa_device *tfa
+		= container_of(work, struct tfa_device, wait_cal_work.work);
+	int i;
+
+	pr_info("%s: enter with dev_idx %d\n", __func__, tfa->dev_idx);
+
+	tfa_wait_cal(tfa);
+
+	for (i = 0; i < MAX_HANDLES; i++) {
+		struct tfa_device *ntfa
+			= tfa98xx_get_tfa_device_from_index(i);
+
+		if (ntfa == NULL)
+			continue;
+
+		if ((ntfa->active_handle != -1)
+			&& (ntfa->active_handle != i))
+			continue;
+
+		/* force UNMUTE after processing calibration */
+		pr_debug("%s: [%d] force UNMUTE after processing calibration\n",
+			__func__, ntfa->dev_idx);
+		tfa_dev_set_state(ntfa, TFA_STATE_UNMUTE, 1);
+	}
+}
+#endif
 
 /* return sign extended tap pattern */
 int tfa_get_tap_pattern(struct tfa_device *tfa)
@@ -4314,7 +4358,7 @@ enum tfa_error tfa_dev_start(struct tfa_device *tfa,
 			err = (enum tfa98xx_error)
 				tfa_dev_stop(tfa); /* stop inactive handle */
 
-			return err;
+			return tfa98xxTotfa(err);
 		}
 	}
 #endif /* TFA_USE_DEVICE_SPECIFIC_CONTROL */
@@ -4463,7 +4507,7 @@ enum tfa_error tfa_dev_start(struct tfa_device *tfa,
 error_exit:
 	show_current_state(tfa);
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 enum tfa_error tfa_dev_switch_profile(struct tfa_device *tfa,
@@ -4500,8 +4544,8 @@ enum tfa_error tfa_dev_switch_profile(struct tfa_device *tfa,
 			__func__, active_profile, next_profile);
 		err = tfa_cont_write_profile(tfa, next_profile, vstep);
 		if (err != TFA98XX_ERROR_OK) {
-			mutex_unlock(&device_lock);
-			return err;
+			mutex_unlock(&dev_lock);
+			return tfa98xxTotfa(err);
 		}
 	}
 	mutex_unlock(&device_lock);
@@ -4514,7 +4558,7 @@ enum tfa_error tfa_dev_switch_profile(struct tfa_device *tfa,
 	if (strnstr(prof_name, ".standby", strlen(prof_name)) != NULL) {
 		tfa_dev_set_swprof(tfa, (unsigned short)next_profile);
 		tfa_dev_set_swvstep(tfa, (unsigned short)vstep);
-		return err;
+		return tfa98xxTotfa(err);
 	}
 
 	err = show_current_state(tfa);
@@ -4523,18 +4567,18 @@ enum tfa_error tfa_dev_switch_profile(struct tfa_device *tfa,
 		&& (vstep != tfa->vstep) && (vstep != -1)) {
 		err = tfa_cont_write_files_vstep(tfa, next_profile, vstep);
 		if (err != TFA98XX_ERROR_OK)
-			return err;
+			return tfa98xxTotfa(err);
 	}
 
 	/* Always search and apply filters after a startup */
 	err = tfa_set_filters(tfa, next_profile);
 	if (err != TFA98XX_ERROR_OK)
-		return err;
+		return tfa98xxTotfa(err);
 
 	tfa_dev_set_swprof(tfa, (unsigned short)next_profile);
 	tfa_dev_set_swvstep(tfa, (unsigned short)vstep);
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 enum tfa_error tfa_dev_stop(struct tfa_device *tfa)
@@ -4558,7 +4602,7 @@ enum tfa_error tfa_dev_stop(struct tfa_device *tfa)
 	/* powerdown CF */
 	err = tfa98xx_powerdown(tfa, 1);
 	if (err != TFA98XX_ERROR_OK)
-		return err;
+		return tfa98xxTotfa(err);
 
 	/* disable I2S output on TFA1 devices without TDM */
 	err = tfa98xx_aec_output(tfa, 0);
@@ -4590,7 +4634,7 @@ enum tfa_error tfa_dev_stop(struct tfa_device *tfa)
 		dsp_cal_value[0] = dsp_cal_value[1] = -1;
 	}
 
-	return err;
+	return tfa98xxTotfa(err);
 }
 
 /*
@@ -5373,7 +5417,7 @@ tfa_dev_set_state(struct tfa_device *tfa,
 
 		/* Make sure the DSP is running! */
 		do {
-			err = tfa98xx_dsp_system_stable(tfa, &ready);
+			err = tfa98xxTotfa(tfa98xx_dsp_system_stable(tfa, &ready));
 			if (err != tfa_error_ok)
 				return err;
 			if (ready)
@@ -5383,7 +5427,7 @@ tfa_dev_set_state(struct tfa_device *tfa,
 		if (((!tfa->is_probus_device) && (is_calibration))
 			|| ((tfa->rev & 0xff) == 0x13)) {
 			/* Enable FAIM when clock is stable, to avoid MTP corruption */
-			err = tfa98xx_faim_protect(tfa, 1);
+			err = tfa98xxTotfa(tfa98xx_faim_protect(tfa, 1));
 			if (tfa->verbose)
 				pr_debug("FAIM enabled (err:%d).\n", err);
 		}
@@ -5412,7 +5456,7 @@ tfa_dev_set_state(struct tfa_device *tfa,
 		}
 		if (((!tfa->is_probus_device) && (is_calibration))
 			|| ((tfa->rev & 0xff) == 0x13)) {
-			err = tfa98xx_faim_protect(tfa, 0);
+			err = tfa98xxTotfa(tfa98xx_faim_protect(tfa, 0));
 			if (tfa->verbose)
 				pr_debug("FAIM disabled (err:%d).\n", err);
 		}
@@ -5546,14 +5590,14 @@ enum tfa_error tfa_dev_mtp_set(struct tfa_device *tfa,
 
 	switch (item) {
 	case TFA_MTP_OTC:
-		err = tfa98xx_set_mtp(tfa,
+		err = tfa98xxTotfa(tfa98xx_set_mtp(tfa,
 			(uint16_t)(value << TFA98XX_KEY2_PROTECTED_MTP0_MTPOTC_POS),
-			TFA98XX_KEY2_PROTECTED_MTP0_MTPOTC_MSK);
+			TFA98XX_KEY2_PROTECTED_MTP0_MTPOTC_MSK));
 		break;
 	case TFA_MTP_EX:
-		err = tfa98xx_set_mtp(tfa,
+		err = tfa98xxTotfa(tfa98xx_set_mtp(tfa,
 			(uint16_t)(value << TFA98XX_KEY2_PROTECTED_MTP0_MTPEX_POS),
-			TFA98XX_KEY2_PROTECTED_MTP0_MTPEX_MSK);
+			TFA98XX_KEY2_PROTECTED_MTP0_MTPEX_MSK));
 		break;
 	case TFA_MTP_RE25:
 	case TFA_MTP_RE25_PRIM:
