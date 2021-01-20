@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,16 +16,18 @@
 
 #include "msm_kms.h"
 #include "dp_panel.h"
-#include <drm/drm_edid.h>
 
 #define DP_PANEL_DEFAULT_BPP 24
 #define DP_MAX_DS_PORT_COUNT 1
 
 #define DPRX_FEATURE_ENUMERATION_LIST 0x2210
-#define DPRX_EXTENDED_DPCD_FIELD 0x2200
 #define VSC_SDP_EXTENSION_FOR_COLORIMETRY_SUPPORTED BIT(3)
 #define VSC_EXT_VESA_SDP_SUPPORTED BIT(4)
 #define VSC_EXT_VESA_SDP_CHAINING_SUPPORTED BIT(5)
+
+#ifdef CONFIG_LGE_DISPLAY_SUPPORT_DP_KOPIN
+extern bool is_kopin;
+#endif
 
 enum dp_panel_hdr_pixel_encoding {
 	RGB,
@@ -117,15 +119,32 @@ static const u8 vendor_name[8] = {81, 117, 97, 108, 99, 111, 109, 109};
 /* MODEL NAME */
 static const u8 product_desc[16] = {83, 110, 97, 112, 100, 114, 97, 103,
 	111, 110, 0, 0, 0, 0, 0, 0};
-
+#ifdef CONFIG_LGE_DISPLAY_SUPPORT_DP_KOPIN
+static u8 kopin_edid[256] = {
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x31, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x05, 0x16, 0x01, 0x03, 0x6d, 0x11, 0x0a, 0x78, 0xea, 0x5e, 0xc0, 0xa4, 0x59, 0x4a, 0x98, 0x25,
+	0x20, 0x50, 0x54, 0x00, 0x00, 0x00, 0x4b, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x2f, 0x0d, 0x50, 0xf0, 0x30, 0xe0, 0x25, 0x10, 0x10, 0x70,
+	0x68, 0x00, 0xb0, 0x64, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xff, 0x00, 0x4c, 0x69, 0x6e,
+	0x75, 0x78, 0x20, 0x23, 0x30, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b,
+	0x3d, 0x1e, 0x20, 0x04, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc,
+	0x00, 0x4b, 0x6f, 0x70, 0x69, 0x6e, 0x20, 0x4b, 0x43, 0x44, 0x0a, 0x20, 0x20, 0x20, 0x00, 0x34,
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x31, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x05, 0x16, 0x01, 0x03, 0x6d, 0x11, 0x0a, 0x78, 0xea, 0x5e, 0xc0, 0xa4, 0x59, 0x4a, 0x98, 0x25,
+	0x20, 0x50, 0x54, 0x00, 0x00, 0x00, 0x4b, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x2f, 0x0d, 0x50, 0xf0, 0x30, 0xe0, 0x25, 0x10, 0x10, 0x70,
+	0x68, 0x00, 0xb0, 0x64, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xff, 0x00, 0x4c, 0x69, 0x6e,
+	0x75, 0x78, 0x20, 0x23, 0x30, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b,
+	0x3d, 0x1e, 0x20, 0x04, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc,
+	0x00, 0x4b, 0x6f, 0x70, 0x69, 0x6e, 0x20, 0x4b, 0x43, 0x44, 0x0a, 0x20, 0x20, 0x20, 0x00, 0x34};
+#endif
 static int dp_panel_read_dpcd(struct dp_panel *dp_panel, bool multi_func)
 {
 	int rlen, rc = 0;
 	struct dp_panel_private *panel;
 	struct drm_dp_link *link_info;
-	struct drm_dp_aux *drm_aux;
-	u8 *dpcd, rx_feature, temp;
-	u32 dfp_count = 0, offset = DP_DPCD_REV;
+	u8 *dpcd, rx_feature;
+	u32 dfp_count = 0;
 	unsigned long caps = DP_LINK_CAP_ENHANCED_FRAMING;
 
 	if (!dp_panel) {
@@ -137,64 +156,50 @@ static int dp_panel_read_dpcd(struct dp_panel *dp_panel, bool multi_func)
 	dpcd = dp_panel->dpcd;
 
 	panel = container_of(dp_panel, struct dp_panel_private, dp_panel);
-	drm_aux = panel->aux->drm_aux;
 	link_info = &dp_panel->link_info;
 
-	/* reset vsc data */
-	panel->vsc_supported = false;
-	panel->vscext_supported = false;
-	panel->vscext_chaining_supported = false;
+	if (!panel->custom_dpcd) {
+#ifdef CONFIG_LGE_DISPLAY_SUPPORT_DP_KOPIN
+		if (is_kopin) {
+			u8 edp_config = 0x1;
+			drm_dp_dpcd_write(panel->aux->drm_aux, 0x10a, &edp_config, 1);
+		}
+#endif
+		rlen = drm_dp_dpcd_read(panel->aux->drm_aux, DP_DPCD_REV,
+			dp_panel->dpcd, (DP_RECEIVER_CAP_SIZE + 1));
+		if (rlen < (DP_RECEIVER_CAP_SIZE + 1)) {
+			pr_err("dpcd read failed, rlen=%d\n", rlen);
+			if (rlen == -ETIMEDOUT)
+				rc = rlen;
+			else
+				rc = -EINVAL;
 
-	if (panel->custom_dpcd) {
-		pr_debug("skip dpcd read in debug mode\n");
-		goto skip_dpcd_read;
+			goto end;
+		}
 	}
-
-	rlen = drm_dp_dpcd_read(drm_aux, DP_TRAINING_AUX_RD_INTERVAL, &temp, 1);
-	if (rlen != 1) {
-		pr_err("error reading DP_TRAINING_AUX_RD_INTERVAL\n");
-		rc = -EINVAL;
-		goto end;
-	}
-
-	/* check for EXTENDED_RECEIVER_CAPABILITY_FIELD_PRESENT */
-	if (temp & BIT(7)) {
-		pr_debug("using EXTENDED_RECEIVER_CAPABILITY_FIELD\n");
-		offset = DPRX_EXTENDED_DPCD_FIELD;
-	}
-
-	rlen = drm_dp_dpcd_read(drm_aux, offset,
-		dp_panel->dpcd, (DP_RECEIVER_CAP_SIZE + 1));
-	if (rlen < (DP_RECEIVER_CAP_SIZE + 1)) {
-		pr_err("dpcd read failed, rlen=%d\n", rlen);
-		if (rlen == -ETIMEDOUT)
-			rc = rlen;
-		else
-			rc = -EINVAL;
-
-		goto end;
-	}
-
-	print_hex_dump(KERN_DEBUG, "[drm-dp] SINK DPCD: ",
-		DUMP_PREFIX_NONE, 8, 1, dp_panel->dpcd, rlen, false);
 
 	rlen = drm_dp_dpcd_read(panel->aux->drm_aux,
 		DPRX_FEATURE_ENUMERATION_LIST, &rx_feature, 1);
 	if (rlen != 1) {
 		pr_debug("failed to read DPRX_FEATURE_ENUMERATION_LIST\n");
-		goto skip_dpcd_read;
-	}
-	panel->vsc_supported = !!(rx_feature &
-		VSC_SDP_EXTENSION_FOR_COLORIMETRY_SUPPORTED);
-	panel->vscext_supported = !!(rx_feature & VSC_EXT_VESA_SDP_SUPPORTED);
-	panel->vscext_chaining_supported = !!(rx_feature &
+		panel->vsc_supported = false;
+		panel->vscext_supported = false;
+		panel->vscext_chaining_supported = false;
+	} else {
+		panel->vsc_supported = !!(rx_feature &
+			VSC_SDP_EXTENSION_FOR_COLORIMETRY_SUPPORTED);
+
+		panel->vscext_supported = !!(rx_feature &
+			VSC_EXT_VESA_SDP_SUPPORTED);
+
+		panel->vscext_chaining_supported = !!(rx_feature &
 			VSC_EXT_VESA_SDP_CHAINING_SUPPORTED);
+	}
 
 	pr_debug("vsc=%d, vscext=%d, vscext_chaining=%d\n",
 		panel->vsc_supported, panel->vscext_supported,
 		panel->vscext_chaining_supported);
 
-skip_dpcd_read:
 	link_info->revision = dp_panel->dpcd[DP_DPCD_REV];
 
 	panel->major = (link_info->revision >> 4) & 0x0f;
@@ -258,24 +263,8 @@ static int dp_panel_set_default_link_params(struct dp_panel *dp_panel)
 
 	return 0;
 }
-static int dp_panel_validate_edid(struct edid *edid, size_t edid_size)
-{
-	if (!edid || (edid_size < EDID_LENGTH))
-		return false;
 
-	if (EDID_LENGTH * (edid->extensions + 1) > edid_size) {
-		pr_err("edid size does not match allocated.\n");
-		return false;
-	}
-	if (!drm_edid_is_valid(edid)) {
-		pr_err("invalid edid.\n");
-		return false;
-	}
-	return true;
-}
-
-static int dp_panel_set_edid(struct dp_panel *dp_panel, u8 *edid,
-		size_t edid_size)
+static int dp_panel_set_edid(struct dp_panel *dp_panel, u8 *edid)
 {
 	struct dp_panel_private *panel;
 
@@ -286,14 +275,13 @@ static int dp_panel_set_edid(struct dp_panel *dp_panel, u8 *edid,
 
 	panel = container_of(dp_panel, struct dp_panel_private, dp_panel);
 
-	if (edid && dp_panel_validate_edid((struct edid *)edid, edid_size)) {
+	if (edid) {
 		dp_panel->edid_ctrl->edid = (struct edid *)edid;
 		panel->custom_edid = true;
 	} else {
 		panel->custom_edid = false;
 	}
 
-	pr_debug("%d\n", panel->custom_edid);
 	return 0;
 }
 
@@ -318,8 +306,6 @@ static int dp_panel_set_dpcd(struct dp_panel *dp_panel, u8 *dpcd)
 		panel->custom_dpcd = false;
 	}
 
-	pr_debug("%d\n", panel->custom_dpcd);
-
 	return 0;
 }
 
@@ -328,6 +314,7 @@ static int dp_panel_read_edid(struct dp_panel *dp_panel,
 {
 	int ret = 0;
 	struct dp_panel_private *panel;
+	int count = 0;
 
 	if (!dp_panel) {
 		pr_err("invalid input\n");
@@ -337,13 +324,23 @@ static int dp_panel_read_edid(struct dp_panel *dp_panel,
 
 	panel = container_of(dp_panel, struct dp_panel_private, dp_panel);
 
+#ifdef CONFIG_LGE_DISPLAY_SUPPORT_DP_KOPIN
+	if (is_kopin)
+		dp_panel_set_edid(dp_panel, kopin_edid);
+	else
+		panel->custom_edid = 0;
+#endif
 	if (panel->custom_edid) {
 		pr_debug("skip edid read in debug mode\n");
 		goto end;
 	}
 
-	sde_get_edid(connector, &panel->aux->drm_aux->ddc,
-		(void **)&dp_panel->edid_ctrl);
+	do {
+		sde_get_edid(connector, &panel->aux->drm_aux->ddc,
+			(void **)&dp_panel->edid_ctrl);
+          	msleep(50);
+		pr_info(" %s %d EDID read %s, count=%d", __func__, __LINE__, !dp_panel->edid_ctrl->edid?"failed":"successed",count);
+	} while (!dp_panel->edid_ctrl->edid && (count++ < 10));
 	if (!dp_panel->edid_ctrl->edid) {
 		pr_err("EDID read failed\n");
 		ret = -EINVAL;
@@ -381,7 +378,14 @@ static int dp_panel_read_sink_caps(struct dp_panel *dp_panel,
 		pr_err("panel dpcd read failed/incorrect, set default params\n");
 		dp_panel_set_default_link_params(dp_panel);
 	}
-
+#ifdef CONFIG_LGE_DISPLAY_SUPPORT_DP_KOPIN
+	if (is_kopin) {
+		if (dp_panel->dpcd[DP_DPCD_REV] == 0x13) {
+			pr_info("[drm-dp] rev 1.3...\n");
+			goto end;
+		}
+	}
+#endif
 	downstream_ports = dp_panel->dpcd[DP_DOWNSTREAMPORT_PRESENT] &
 				DP_DWN_STRM_PORT_PRESENT;
 
