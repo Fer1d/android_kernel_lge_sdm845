@@ -400,7 +400,6 @@ CONFIG_DMA_CMA=y
 #
 
 CONFIG_ZRAM=y
-CONFIG_ZRAM_ASYNC_IO=y  去掉
 
 #
 # Compression
