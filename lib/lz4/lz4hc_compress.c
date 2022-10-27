@@ -106,14 +106,12 @@ static FORCE_INLINE int LZ4HC_InsertAndFindBestMatch(
 	U16 * const chainTable = hc4->chainTable;
 	U32 * const HashTable = hc4->hashTable;
 	const BYTE * const base = hc4->base;
-	const BYTE * const dictBase = hc4->dictBase;
-	const U32 dictLimit = hc4->dictLimit;
-	const U32 lowLimit = (hc4->lowLimit + 64 * KB > (U32)(ip - base))
-		? hc4->lowLimit
-		: (U32)(ip - base) - (64 * KB - 1);
-	U32 matchIndex;
-	int nbAttempts = maxNbAttempts;
-	size_t ml = 0;
+#else
+	const int base = 0;
+#endif
+	int nbattempts = MAX_NB_ATTEMPTS;
+	size_t repl = 0, ml = 0;
+	u16 delta;
 
 	/* HC4 match finder */
 	LZ4HC_Insert(hc4, ip);
