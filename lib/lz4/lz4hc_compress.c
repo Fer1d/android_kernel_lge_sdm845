@@ -106,12 +106,14 @@ static FORCE_INLINE int LZ4HC_InsertAndFindBestMatch(
 	U16 * const chainTable = hc4->chainTable;
 	U32 * const HashTable = hc4->hashTable;
 	const BYTE * const base = hc4->base;
-#else
-	const int base = 0;
-#endif
-	int nbattempts = MAX_NB_ATTEMPTS;
-	size_t repl = 0, ml = 0;
-	u16 delta;
+	const BYTE * const dictBase = hc4->dictBase;
+	const U32 dictLimit = hc4->dictLimit;
+	const U32 lowLimit = (hc4->lowLimit + 64 * KB > (U32)(ip - base))
+		? hc4->lowLimit
+		: (U32)(ip - base) - (64 * KB - 1);
+	U32 matchIndex;
+	int nbAttempts = maxNbAttempts;
+	size_t ml = 0;
 
 	/* HC4 match finder */
 	LZ4HC_Insert(hc4, ip);
@@ -291,7 +293,7 @@ static FORCE_INLINE int LZ4HC_encodeSequence(
 		*token = (BYTE)(length<<ML_BITS);
 
 	/* Copy Literals */
-	LZ4_wildCopy(*op, *anchor, (*op) + length);
+	LZ4_wildCopy8(*op, *anchor, (*op) + length);
 	*op += length;
 
 	/* Encode Offset */
@@ -600,7 +602,7 @@ static int LZ4_compress_HC_extStateHC(
 			srcSize, maxDstSize, compressionLevel, limitedOutput);
 	else
 		return LZ4HC_compress_generic(ctx, src, dst,
-			srcSize, maxDstSize, compressionLevel, noLimit);
+			srcSize, maxDstSize, compressionLevel, notLimited);
 }
 
 int LZ4_compress_HC(const char *src, char *dst, int srcSize,
@@ -614,13 +616,13 @@ EXPORT_SYMBOL(LZ4_compress_HC);
 /**************************************
  *	Streaming Functions
  **************************************/
-static void LZ4_resetStreamHC(LZ4_streamHC_t *LZ4_streamHCPtr, int compressionLevel)
+void LZ4_resetStreamHC(LZ4_streamHC_t *LZ4_streamHCPtr, int compressionLevel)
 {
 	LZ4_streamHCPtr->internal_donotuse.base = NULL;
 	LZ4_streamHCPtr->internal_donotuse.compressionLevel = (unsigned int)compressionLevel;
 }
 
-static int LZ4_loadDictHC(LZ4_streamHC_t *LZ4_streamHCPtr,
+int LZ4_loadDictHC(LZ4_streamHC_t *LZ4_streamHCPtr,
 	const char *dictionary,
 	int dictSize)
 {
@@ -636,6 +638,7 @@ static int LZ4_loadDictHC(LZ4_streamHC_t *LZ4_streamHCPtr,
 	ctxPtr->end = (const BYTE *)dictionary + dictSize;
 	return dictSize;
 }
+EXPORT_SYMBOL(LZ4_loadDictHC);
 
 /* compression */
 
@@ -710,7 +713,7 @@ static int LZ4_compressHC_continue_generic(
 		inputSize, maxOutputSize, ctxPtr->compressionLevel, limit);
 }
 
-static int LZ4_compress_HC_continue(
+int LZ4_compress_HC_continue(
 	LZ4_streamHC_t *LZ4_streamHCPtr,
 	const char *source,
 	char *dest,
@@ -722,12 +725,13 @@ static int LZ4_compress_HC_continue(
 			source, dest, inputSize, maxOutputSize, limitedOutput);
 	else
 		return LZ4_compressHC_continue_generic(LZ4_streamHCPtr,
-			source, dest, inputSize, maxOutputSize, noLimit);
+			source, dest, inputSize, maxOutputSize, notLimited);
 }
+EXPORT_SYMBOL(LZ4_compress_HC_continue);
 
 /* dictionary saving */
 
-static int LZ4_saveDictHC(
+int LZ4_saveDictHC(
 	LZ4_streamHC_t *LZ4_streamHCPtr,
 	char *safeBuffer,
 	int dictSize)
