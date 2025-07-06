@@ -164,7 +164,6 @@ STATIC inline int INIT unlz4(u8 *input, long in_len,
 		chunksize = ret;
 #else
 		dest_len = uncomp_chunksize;
-
 		ret = LZ4_decompress_safe(inp, outp, chunksize, dest_len);
 		dest_len = ret;
 #endif
