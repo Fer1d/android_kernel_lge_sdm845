@@ -1,0 +1,8 @@
+This branch is created to perform a merge of branch 4.9.337 into 10.
+
+Plan:
+1. Create a merge commit on branch `merge/4.9.337-into-10` that merges `4.9.337`.
+2. Resolve conflicts if any.
+3. Push the result to the repository branch `merge/4.9.337-into-10`.
+
+If you want me to proceed with the actual merge commit (create a pull request or push a merge), confirm and I will continue.
