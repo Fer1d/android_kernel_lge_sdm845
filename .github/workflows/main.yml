@@ -1,0 +1,48 @@
+name: Mirror repository to another repo (mirror push, includes LFS)
+
+on:
+  workflow_dispatch:
+
+env:
+  TARGET_REPO: Fer1d/LMG710_Kernel-detached  # 修改为你在步骤1创建的目标仓库 full name
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git-lfs curl jq
+          git lfs install --system
+
+      - name: Mirror-clone source repo
+        run: |
+          # 用 --mirror 获取所有 refs（包括所有分支和 tags）
+          git clone --mirror https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ github.repository }}.git repo.git
+          ls -la repo.git
+        shell: bash
+
+      - name: Push all git refs to target (mirror)
+        run: |
+          cd repo.git
+          # 设置目标远端（使用 PAT）
+          git remote remove origin || true
+          git remote add target https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git
+          # 推送所有 refs
+          git push --mirror target
+        shell: bash
+
+      - name: Migrate LFS objects (if any)
+        run: |
+          # 进入 repo 镜像的工作目录并推送 LFS objects
+          cd repo.git || exit 1
+          # 如果仓库没有 LFS，此命令会很快完成
+          git lfs fetch --all || true
+          git lfs push --all https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git || true
+        shell: bash
+
+      - name: Done - list remote refs of target for verification
+        run: |
+          git ls-remote https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git
+        shell: bash
