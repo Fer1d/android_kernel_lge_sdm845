@@ -23,21 +23,21 @@ jobs:
           ls -la repo.git
         shell: bash
 
-      - name: Push all git refs to target (mirror)
+      - name: Push branches and tags to target
         run: |
           cd repo.git
           # 设置目标远端（使用 PAT）
           git remote remove origin || true
           git remote add target https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git
-          # 推送所有 refs
-          git push --mirror target
+          # 推送所有分支
+          git push --prune target 'refs/heads/*:refs/heads/*'
+          # 推送所有 tag
+          git push target 'refs/tags/*:refs/tags/*'
         shell: bash
 
       - name: Migrate LFS objects (if any)
         run: |
-          # 进入 repo 镜像的工作目录并推送 LFS objects
           cd repo.git || exit 1
-          # 如果仓库没有 LFS，此命令会很快完成
           git lfs fetch --all || true
           git lfs push --all https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ env.TARGET_REPO }}.git || true
         shell: bash
