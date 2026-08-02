@@ -1940,67 +1940,12 @@ static int mmc_blk_cmdq_issue_discard_rq(struct mmc_queue *mq,
 
 	cmdq_req = mmc_blk_cmdq_prep_discard_req(mq, req);
 	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
-		__mmc_switch_cmdq_mode(cmdq_req->mrq.cmd,
-				EXT_CSD_CMD_SET_NORMAL,
-				INAND_CMD38_ARG_EXT_CSD,
-				arg == MMC_TRIM_ARG ?
-				INAND_CMD38_ARG_TRIM :
-				INAND_CMD38_ARG_ERASE,
-				0, true, false);
-		err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
-		if (err)
-			goto clear_dcmd;
-	}
-	err = mmc_cmdq_erase(cmdq_req, card, from, nr, arg);
-clear_dcmd:
-	/*
-	 * If some other request got an error while there is a DCMD request
-	 * in the command queue, then err will be updated with -EAGAIN by the
-	 * error handler, which indicates that caller must not call
-	 * blk_complete_request() and let the request by handled by error
-	 * hanlder. In all other cases, the caller only must call
-	 * blk_complete_request().
-	 */
-	if (err != -EAGAIN) {
-		mmc_host_clk_hold(card->host);
-		blk_complete_request(req);
-	} else {
-		pr_err("%s: err(%d) handled by cmdq-error handler\n",
-			__func__, err);
-	}
-out:
-	return err ? 1 : 0;
-}
-
-static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
-{
-	struct mmc_blk_data *md = mq->data;
-	struct mmc_card *card = md->queue.card;
-	unsigned int from, nr, arg;
-	int err = 0, type = MMC_BLK_DISCARD;
-
-	if (!mmc_can_erase(card)) {
-		err = -EOPNOTSUPP;
-		goto out;
-	}
-
-	from = blk_rq_pos(req);
-	nr = blk_rq_sectors(req);
-
-	if (mmc_can_discard(card))
-		arg = MMC_DISCARD_ARG;
-	else if (mmc_can_trim(card))
-		arg = MMC_TRIM_ARG;
-	else
-		arg = MMC_ERASE_ARG;
-retry:
-	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
 		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 				 INAND_CMD38_ARG_EXT_CSD,
 				 arg == MMC_TRIM_ARG ?
 				 INAND_CMD38_ARG_TRIM :
 				 INAND_CMD38_ARG_ERASE,
-				 0);
+				 card->ext_csd.generic_cmd6_time);
 		if (err)
 			goto out;
 	}
@@ -2111,7 +2056,7 @@ retry:
 				 arg == MMC_SECURE_TRIM1_ARG ?
 				 INAND_CMD38_ARG_SECTRIM1 :
 				 INAND_CMD38_ARG_SECERASE,
-				 0);
+				 card->ext_csd.generic_cmd6_time);
 		if (err)
 			goto out_retry;
 	}
@@ -2127,7 +2072,7 @@ retry:
 			err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 					 INAND_CMD38_ARG_EXT_CSD,
 					 INAND_CMD38_ARG_SECTRIM2,
-					 0);
+					 card->ext_csd.generic_cmd6_time);
 			if (err)
 				goto out_retry;
 		}
