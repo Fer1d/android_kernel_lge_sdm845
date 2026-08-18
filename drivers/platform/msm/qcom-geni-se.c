@@ -355,7 +355,6 @@ static int geni_se_select_dma_mode(void __iomem *base)
 	int proto = get_se_proto(base);
 	unsigned int geni_dma_mode = 0;
 	unsigned int common_geni_m_irq_en;
-	int proto = get_se_proto(base);
 
 	geni_write_reg(0, base, SE_GSI_EVENT_EN);
 	geni_write_reg(0xFFFFFFFF, base, SE_GENI_M_IRQ_CLEAR);
