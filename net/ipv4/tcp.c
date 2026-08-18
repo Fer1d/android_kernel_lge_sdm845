@@ -380,24 +380,10 @@ static int retrans_to_secs(u8 retrans, int timeout, int rto_max)
 }
 
 #ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
-
-#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
-/*
- * KudProject 4.9.337 tcp_select_initial_window() takes struct net * as its
- * first argument; the LGE MPTCP tcp_sock_ops signature uses the sock.
- */
-static void tcp_specific_select_initial_window(int __space, __u32 mss,
-			__u32 *rcv_wnd, __u32 *window_clamp, int wscale_ok,
-			__u8 *rcv_wscale, __u32 init_rcv_wnd,
-			const struct sock *sk)
-{
-	tcp_select_initial_window(sock_net(sk), __space, mss, rcv_wnd,
-				  window_clamp, wscale_ok, rcv_wscale, init_rcv_wnd);
-}
 const struct tcp_sock_ops tcp_specific = {
 	.__select_window		= __tcp_select_window,
 	.select_window			= tcp_select_window,
-	.select_initial_window		= tcp_specific_select_initial_window,
+	.select_initial_window		= tcp_select_initial_window,
 	.select_size			= select_size,
 	.init_buffer_space		= tcp_init_buffer_space,
 	.set_rto			= tcp_set_rto,
