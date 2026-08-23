@@ -715,3 +715,34 @@ out_mm:
 out:
 	return res;
 }
+
+/**
+ * kvmalloc - allocate memory, try kmalloc first, fallback to vmalloc
+ * @size: size of the memory to allocate
+ * @flags: gfp mask
+ *
+ * Return: pointer to the allocated memory of @size bytes or %NULL if
+ * we are out of memory. kmalloc is used first, as it performs better
+ * for small objects. If the allocation fails, vmalloc is used.
+ */
+void *kvmalloc(size_t size, gfp_t flags)
+{
+	void *ret;
+
+	ret = kmalloc(size, flags | __GFP_NOWARN);
+	if (!ret)
+		ret = __vmalloc(size, flags, PAGE_KERNEL);
+	return ret;
+}
+EXPORT_SYMBOL(kvmalloc);
+
+void *kvzalloc(size_t size, gfp_t flags)
+{
+	void *ret;
+
+	ret = kzalloc(size, flags | __GFP_NOWARN);
+	if (!ret)
+		ret = __vmalloc(size, flags | __GFP_ZERO, PAGE_KERNEL);
+	return ret;
+}
+EXPORT_SYMBOL(kvzalloc);
