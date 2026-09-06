@@ -479,13 +479,14 @@ ifdef CONFIG_LTO_CLANG
   ifdef CONFIG_MODVERSIONS
     # combine symversions for later processing
     update_lto_symversions =				\
+	$(file >$@.symversions.list,$(filter-out FORCE,$^)) \
 	rm -f $@.symversions; 				\
-	for i in $(filter-out FORCE,$^); do		\
-		if [ -f $$i.symversions ]; then		\
-			cat $$i.symversions 		\
-				>> $@.symversions;	\
+	for i in $$(cat $@.symversions.list 2>/dev/null); do \
+		if [ -f "$$i.symversions" ]; then	\
+			cat "$$i.symversions";		\
 		fi;					\
-	done;
+	done > $@.symversions;				\
+	rm -f $@.symversions.list
   endif
   # rebuild the symbol table with llvm-ar to include IR files
   update_lto_symtable = ;				\
