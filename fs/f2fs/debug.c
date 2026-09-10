@@ -345,14 +345,7 @@ static int stat_show(struct seq_file *s, void *v)
 		seq_printf(s, "  - Indir nodes: %d, %d, %d\n",
 			   si->curseg[CURSEG_COLD_NODE],
 			   si->cursec[CURSEG_COLD_NODE],
-			   si->curzone[CURSEG_COLD_NODE],
-			   si->dirty_seg[CURSEG_COLD_NODE],
-			   si->full_seg[CURSEG_COLD_NODE],
-			   si->valid_blks[CURSEG_COLD_NODE]);
-		seq_printf(s, "  - Pinned file: %8d %8d %8d\n",
-			   si->curseg[CURSEG_COLD_DATA_PINNED],
-			   si->cursec[CURSEG_COLD_DATA_PINNED],
-			   si->curzone[CURSEG_COLD_DATA_PINNED]);
+			   si->curzone[CURSEG_COLD_NODE]);
 		seq_printf(s, "\n  - Valid: %d\n  - Dirty: %d\n",
 			   si->main_area_segs - si->dirty_count -
 			   si->prefree_count - si->free_segs,
