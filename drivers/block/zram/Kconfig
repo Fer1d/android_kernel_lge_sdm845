@@ -77,3 +77,12 @@ config ZRAM_MEMORY_TRACKING
 	  /sys/kernel/debug/zram/zramX/block_state.
 
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
+
+config ZRAM_MULTI_COMP
+	bool "Enable multiple compression algorithms"
+	depends on ZRAM
+	help
+	  This will allow to set up multiple compression algorithms for zram.
+	  The algorithms are used in the order of their priority - the primary
+	  one for new pages and secondary ones for recompression of pages that
+	  were stored with the primary algorithm.
