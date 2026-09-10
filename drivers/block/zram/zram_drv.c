@@ -184,11 +184,11 @@ static inline bool valid_io_request(struct zram *zram,
 {
 	u64 end, bound;
 
-	/* unaligned request */
-	if (unlikely(start & (ZRAM_SECTOR_PER_LOGICAL_BLOCK - 1)))
-		return false;
-	if (unlikely(size & (ZRAM_LOGICAL_BLOCK_SIZE - 1)))
-		return false;
+	/*
+	 * Unaligned and sub-page requests are handled by the is_partial_io()
+	 * paths in zram_bvec_read()/zram_bvec_write() (read-modify-write),
+	 * so only the request range needs to be validated here.
+	 */
 
 	end = start + (size >> SECTOR_SHIFT);
 	bound = zram->disksize >> SECTOR_SHIFT;
@@ -336,6 +336,8 @@ static ssize_t idle_store(struct device *dev,
 				!zram_test_flag(zram, index, ZRAM_UNDER_WB))
 			zram_set_flag(zram, index, ZRAM_IDLE);
 		zram_slot_unlock(zram, index);
+
+		cond_resched();
 	}
 
 	up_read(&zram->init_lock);
