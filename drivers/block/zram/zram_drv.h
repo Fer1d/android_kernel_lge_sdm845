@@ -49,6 +49,7 @@ enum zram_pageflags {
 	ZRAM_WB,	/* page is stored on backing_device */
 	ZRAM_UNDER_WB,	/* page is under writeback */
 	ZRAM_HUGE,	/* Incompressible page */
+	ZRAM_COMPRESS_LOW,	/* below the compression target */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 
 	__NR_ZRAM_PAGEFLAGS,
@@ -56,6 +57,9 @@ enum zram_pageflags {
 
 #define ZRAM_IDLE_COUNT_SHIFT	__NR_ZRAM_PAGEFLAGS
 #define ZRAM_IDLE_COUNT_MAX	10
+#define ZRAM_IDLE_COUNT_BITS	4
+#define ZRAM_IDLE_COUNT_MASK	(((1UL << ZRAM_IDLE_COUNT_BITS) - 1) << \
+				 ZRAM_IDLE_COUNT_SHIFT)
 
 /*-- Data structures */
 
@@ -83,6 +87,7 @@ struct zram_stats {
 	atomic64_t huge_pages;		/* no. of huge pages */
 	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
 	atomic64_t pages_stored;	/* no. of pages currently stored */
+	atomic64_t lowratio_pages;	/* pages below the compression target */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 	atomic64_t writestall;		/* no. of write slow paths */
 	atomic64_t miss_free;		/* no. of missed free */
@@ -137,7 +142,7 @@ static inline unsigned int zram_idle_count(struct zram *zram, u32 index)
 
 static inline void zram_clear_idle_count(struct zram *zram, u32 index)
 {
-	zram->table[index].flags &= BIT(ZRAM_IDLE_COUNT_SHIFT) - 1;
+	zram->table[index].flags &= ~ZRAM_IDLE_COUNT_MASK;
 }
 
 static inline void zram_inc_idle_count(struct zram *zram, u32 index)
@@ -145,6 +150,6 @@ static inline void zram_inc_idle_count(struct zram *zram, u32 index)
 	unsigned int count = zram_idle_count(zram, index);
 
 	if (count < ZRAM_IDLE_COUNT_MAX)
-		zram->table[index].flags += BIT(ZRAM_IDLE_COUNT_SHIFT);
+		zram->table[index].flags += 1UL << ZRAM_IDLE_COUNT_SHIFT;
 }
 #endif

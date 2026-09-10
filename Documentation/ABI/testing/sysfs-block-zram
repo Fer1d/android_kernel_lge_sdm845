@@ -130,6 +130,14 @@ Description:
 		The new_stat file is read-only and reports the number of
 		allocated pages that have not yet been marked idle.
 
+What:		/sys/block/zram<id>/low_compress_ratio
+Date:		May 2025
+Contact:	Minchan Kim <minchan@kernel.org>
+Description:
+		The low_compress_ratio file is read-write and specifies the
+		minimum compression saving percentage. Compressed pages below
+		this target are counted in mm_stat. The default is 75.
+
 What:		/sys/block/zram<id>/writeback
 Date:		November 2018
 Contact:	Minchan Kim <minchan@kernel.org>
