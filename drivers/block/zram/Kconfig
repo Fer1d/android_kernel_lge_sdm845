@@ -98,3 +98,12 @@ config ZRAM_DISKSIZE
 	It should be set to XXXX (MB).
 	
 endif
+
+config ZRAM_MULTI_COMP
+	bool "Enable multiple compression algorithms"
+	depends on ZRAM
+	help
+	  This will allow to set up multiple compression algorithms for zram.
+	  The algorithms are used in the order of their priority - the primary
+	  one for new pages and secondary ones for recompression of pages that
+	  were stored with the primary algorithm.
