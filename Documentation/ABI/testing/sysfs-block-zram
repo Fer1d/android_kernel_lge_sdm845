@@ -107,6 +107,29 @@ Description:
 		If system has mounted debugfs, user can see which slots
 		are idle via /sys/kernel/debug/zram/zram<id>/block_state
 
+What:		/sys/block/zram<id>/new
+Date:		May 2025
+Contact:	Minchan Kim <minchan@kernel.org>
+Description:
+		The new file is write-only. Writing "all" clears the idle
+		generation of every allocated slot, treating them as newly
+		stored pages for idle tracking.
+
+What:		/sys/block/zram<id>/idle_stat
+Date:		May 2025
+Contact:		Minchan Kim <minchan@kernel.org>
+Description:
+		The idle_stat file is read-only and reports the number of
+		allocated pages in each idle generation from 1 through 10.
+		Values are separated by spaces.
+
+What:		/sys/block/zram<id>/new_stat
+Date:		May 2025
+Contact:	Minchan Kim <minchan@kernel.org>
+Description:
+		The new_stat file is read-only and reports the number of
+		allocated pages that have not yet been marked idle.
+
 What:		/sys/block/zram<id>/writeback
 Date:		November 2018
 Contact:	Minchan Kim <minchan@kernel.org>
