@@ -40,6 +40,16 @@ config CRYPTO_ALGAPI
 config CRYPTO_ALGAPI2
 	tristate
 
+config CRYPTO_ACOMP2
+	tristate
+	select CRYPTO_ALGAPI2
+	select SGL_ALLOC
+
+config CRYPTO_ACOMP
+	tristate
+	select CRYPTO_ALGAPI
+	select CRYPTO_ACOMP2
+
 config CRYPTO_AEAD
 	tristate
 	select CRYPTO_AEAD2

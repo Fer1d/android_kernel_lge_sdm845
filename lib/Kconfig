@@ -23,6 +23,10 @@ config HAVE_ARCH_BITREVERSE
 config RATIONAL
 	bool
 
+config SGL_ALLOC
+	bool
+	default n
+
 config GENERIC_STRNCPY_FROM_USER
 	bool
 
