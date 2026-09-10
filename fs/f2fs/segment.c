@@ -3504,6 +3504,12 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 		seg_i->next_segno = segno;
 		reset_curseg(sbi, i, 0);
 		seg_i->alloc_type = ckpt->alloc_type[i];
+		if (seg_i->alloc_type != LFS && seg_i->alloc_type != SSR) {
+			f2fs_err(sbi,
+				 "Current segment has invalid alloc_type:%d",
+				 seg_i->alloc_type);
+			return -EFSCORRUPTED;
+		}
 		seg_i->next_blkoff = blk_off;
 
 		if (seg_i->alloc_type == SSR)
