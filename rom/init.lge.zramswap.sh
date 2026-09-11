@@ -26,14 +26,15 @@
 #   persist.zram.page_cluster  vm.page-cluster              (default 0)
 #   persist.zram.watermark     vm.watermark_scale_factor    (default 100)
 #   persist.zram.idle_only     1 = recompress idle pages     (default 0)
+#   persist.zram.recomp_interval  seconds between passes, 0 = never (21600)
+#   persist.zram.recomp_delay     seconds before the first pass     (300)
 #
-# Recompression is userspace driven on purpose. Hook it to a periodic job:
-#   service zram-recompress /vendor/bin/init.lge.zramswap.sh recompress
-#       class late_start
-#       user root
-#       oneshot
-#       disabled
-# and start it from a timer, or when the screen turns off while charging.
+# Recompression is userspace driven on purpose: the driver only runs a pass
+# when "recompress" is written, so something in userspace has to ask for it.
+# init.lge.svelte.rc starts "recompress-loop", which is this script sleeping
+# between passes. A pass is cheap to repeat: the kernel flags a page that no
+# secondary algorithm could shrink as INCOMPRESSIBLE and never tries it again,
+# so every pass only pays for the pages written since the previous one.
 #
 
 target=`getprop ro.board.platform`
@@ -51,6 +52,8 @@ zram_low_ratio=75
 zram_page_cluster=0
 zram_watermark=100
 zram_idle_only=0
+zram_recomp_interval=21600
+zram_recomp_delay=300
 
 zram_swappiness=100
 zram_overcommit=1
@@ -64,6 +67,8 @@ o=`getprop persist.zram.low_ratio`     ; [ -n "$o" ] && zram_low_ratio=$o
 o=`getprop persist.zram.page_cluster`  ; [ -n "$o" ] && zram_page_cluster=$o
 o=`getprop persist.zram.watermark`     ; [ -n "$o" ] && zram_watermark=$o
 o=`getprop persist.zram.idle_only`     ; [ -n "$o" ] && zram_idle_only=$o
+o=`getprop persist.zram.recomp_interval`; [ -n "$o" ] && zram_recomp_interval=$o
+o=`getprop persist.zram.recomp_delay`   ; [ -n "$o" ] && zram_recomp_delay=$o
 
 # --- helpers ----------------------------------------------------------------
 write_if() {  # write_if <file> <value> <label>
@@ -73,6 +78,13 @@ write_if() {  # write_if <file> <value> <label>
     echo "zramswap: $3 FAILED ($1 <- $2)"
     return 1
   fi
+}
+
+num_or() {  # num_or <value> <fallback>: properties are as typed as whoever set them
+  case "$1" in
+    ''|*[!0-9]*) echo "$2" ;;
+    *)           echo "$1" ;;
+  esac
 }
 
 setup_zram() {  # setup_zram <sysfs dir> <device node>
@@ -161,6 +173,31 @@ recompress() {
   done
 }
 
+# Resident timer around recompress(). One sleeping shell is cheaper than any
+# userspace daemon, and sleep does not wake the CPU while it waits. Set
+# persist.zram.recomp_interval to 0 to turn the loop off without repacking.
+recompress_loop() {
+  # A bad property value must not reach sleep: a failing sleep would turn the
+  # loop into a spin that recompresses in a tight circle.
+  zram_recomp_interval=`num_or "${zram_recomp_interval}" 21600`
+  zram_recomp_delay=`num_or "${zram_recomp_delay}" 300`
+
+  if [ "${zram_recomp_interval}" -le 0 ] ; then
+    echo "zramswap: recompress loop disabled (persist.zram.recomp_interval=0)"
+    return 0
+  fi
+
+  # The first pass waits for the boot rush (and for the pages to pile up);
+  # there is nothing to shrink while the system is still starting.
+  echo "zramswap: recompress loop armed (first pass in ${zram_recomp_delay}s, then every ${zram_recomp_interval}s)"
+  sleep "${zram_recomp_delay}"
+
+  while : ; do
+    recompress
+    sleep "${zram_recomp_interval}"
+  done
+}
+
 stop() {
   for node in $(grep zram /proc/swaps | awk '{print $1}') ; do
     swapoff "${node}" && echo "zramswap: swapoff ${node}"
@@ -171,8 +208,9 @@ stop() {
 }
 
 case "${1-start}" in
-  start)      start ;;
-  stop)       stop ;;
-  recompress) recompress ;;
-  *)          echo "usage: $0 {start|stop|recompress}" ;;
+  start)           start ;;
+  stop)            stop ;;
+  recompress)      recompress ;;
+  recompress-loop) recompress_loop ;;
+  *)               echo "usage: $0 {start|stop|recompress|recompress-loop}" ;;
 esac
