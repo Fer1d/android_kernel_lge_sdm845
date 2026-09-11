@@ -64,7 +64,7 @@ static int gc_thread_func(void *data)
 	struct f2fs_gc_control gc_control = {
 		.victim_segno = NULL_SEGNO,
 		.should_migrate_blocks = false,
-		.err_gc_skipped = true };
+		.err_gc_skipped = false };
 
 	set_freezable();
 	do {
@@ -168,8 +168,6 @@ do_gc:
 		gc_control.init_gc_type = (sbi->rapid_gc ||
 				test_opt(sbi, FORCE_FG_GC)) ? FG_GC : BG_GC;
 		gc_control.no_bg_gc = false;
-		gc_control.err_gc_skipped =
-				(gc_control.init_gc_type == FG_GC);
 
 		/* if return value is not zero, no victim was selected */
 		if (f2fs_gc(sbi, &gc_control)) {
