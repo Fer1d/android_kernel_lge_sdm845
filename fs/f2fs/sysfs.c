@@ -40,7 +40,8 @@ static const char *gc_mode_names[MAX_GC_MODE] = {
 	"GC_IDLE_GREEDY",
 	"GC_IDLE_AT",
 	"GC_URGENT_HIGH",
-	"GC_URGENT_LOW"
+	"GC_URGENT_LOW",
+	"GC_URGENT_MID"
 };
 
 struct f2fs_attr {
@@ -374,6 +375,13 @@ out:
 			}
 		} else if (t == 2) {
 			sbi->gc_mode = GC_URGENT_LOW;
+		} else if (t == 3) {
+			sbi->gc_mode = GC_URGENT_MID;
+			if (sbi->gc_thread) {
+				sbi->gc_thread->gc_wake = 1;
+				wake_up_interruptible_all(
+					&sbi->gc_thread->gc_wait_queue_head);
+			}
 		} else {
 			sbi->gc_mode = GC_NORMAL;
 		}
