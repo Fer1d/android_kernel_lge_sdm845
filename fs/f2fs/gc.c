@@ -2068,6 +2068,15 @@ retry:
 
 	if (skipped_round <= MAX_SKIP_GC_COUNT ||
 				skipped_round * 2 < round) {
+
+		/* Write checkpoint to reclaim prefree segments */
+		if (free_sections(sbi) < NR_CURSEG_PERSIST_TYPE &&
+				prefree_segments(sbi) &&
+				!is_sbi_flag_set(sbi, SBI_CP_DISABLED)) {
+			ret = f2fs_write_checkpoint(sbi, &cpc);
+			if (ret)
+				goto stop;
+		}
 		segno = NULL_SEGNO;
 		goto gc_more;
 	}
