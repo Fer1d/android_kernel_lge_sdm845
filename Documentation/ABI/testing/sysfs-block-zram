@@ -137,3 +137,13 @@ Description:
 		The writeback_limit file is read-write and specifies the maximum
 		amount of writeback ZRAM can do. The limit could be changed
 		in run time.
+
+What:		/sys/block/zram<id>/low_compress_ratio
+Date:		May 2025
+Contact:	Fer1d
+Description:
+		The low_compress_ratio file is read-write and holds the
+		threshold, in percent of the original page size, below which
+		a compressed page is counted as poorly compressed and
+		reported as the tenth field of mm_stat. The default is 75;
+		setting it to 0 disables the accounting.
