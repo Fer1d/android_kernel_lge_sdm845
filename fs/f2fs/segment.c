@@ -504,8 +504,15 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	 * dir/node pages without enough free segments.
 	 */
 	if (has_not_enough_free_secs(sbi, 0, 0)) {
+		struct f2fs_gc_control gc_control = {
+			.victim_segno = NULL_SEGNO,
+			.init_gc_type = BG_GC,
+			.no_bg_gc = true,
+			.should_migrate_blocks = false,
+			.err_gc_skipped = false };
+
 		down_write(&sbi->gc_lock);
-		f2fs_gc(sbi, false, false, false, NULL_SEGNO);
+		f2fs_gc(sbi, &gc_control);
 	}
 }
 

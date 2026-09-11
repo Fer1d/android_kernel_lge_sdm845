@@ -61,6 +61,10 @@ static int gc_thread_func(void *data)
 	struct f2fs_gc_kthread *gc_th = sbi->gc_thread;
 	wait_queue_head_t *wq = &sbi->gc_thread->gc_wait_queue_head;
 	unsigned int wait_ms = gc_th->min_sleep_time;
+	struct f2fs_gc_control gc_control = {
+		.victim_segno = NULL_SEGNO,
+		.should_migrate_blocks = false,
+		.err_gc_skipped = true };
 
 	set_freezable();
 	do {
@@ -161,9 +165,14 @@ static int gc_thread_func(void *data)
 do_gc:
 		stat_inc_bggc_count(sbi->stat_info);
 
+		gc_control.init_gc_type = (sbi->rapid_gc ||
+				test_opt(sbi, FORCE_FG_GC)) ? FG_GC : BG_GC;
+		gc_control.no_bg_gc = false;
+		gc_control.err_gc_skipped =
+				(gc_control.init_gc_type == FG_GC);
+
 		/* if return value is not zero, no victim was selected */
-		if (f2fs_gc(sbi, sbi->rapid_gc || test_opt(sbi, FORCE_FG_GC),
-								true, false, NULL_SEGNO)) {
+		if (f2fs_gc(sbi, &gc_control)) {
 			wait_ms = gc_th->no_gc_sleep_time;
 			sbi->rapid_gc = false;
 			rapid_gc_set_wakelock();
@@ -1884,14 +1893,13 @@ skip:
 	return seg_freed;
 }
 
-int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
-			bool background, bool force, unsigned int segno)
+int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 {
-	int gc_type = sync ? FG_GC : BG_GC;
+	int gc_type = gc_control->init_gc_type;
+	unsigned int segno = gc_control->victim_segno;
 	int sec_freed = 0, seg_freed = 0, total_freed = 0;
 	int ret = 0;
 	struct cp_control cpc;
-	unsigned int init_segno = segno;
 	struct gc_inode_list gc_list = {
 		.ilist = LIST_HEAD_INIT(gc_list.ilist),
 		.iroot = RADIX_TREE_INIT(GFP_NOFS),
@@ -1901,7 +1909,7 @@ int f2fs_gc(struct f2fs_sb_info *sbi, bool sync,
 	unsigned long long first_skipped;
 	unsigned int skipped_round = 0, round = 0;
 
-	trace_f2fs_gc_begin(sb, sync, background,
+	trace_f2fs_gc_begin(sb, gc_type, gc_control->no_bg_gc,
 				get_pages(sbi, F2FS_DIRTY_NODES),
 				get_pages(sbi, F2FS_DIRTY_DENTS),
 				get_pages(sbi, F2FS_DIRTY_IMETA),
@@ -1940,7 +1948,7 @@ gc_more:
 	}
 
 	/* f2fs_balance_fs doesn't need to do BG_GC in critical path. */
-	if (gc_type == BG_GC && !background) {
+	if (gc_type == BG_GC && gc_control->no_bg_gc) {
 		ret = -EINVAL;
 		goto stop;
 	}
@@ -1949,7 +1957,8 @@ gc_more:
 		goto stop;
 	}
 
-	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type, force);
+	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type,
+					gc_control->should_migrate_blocks);
 	if (gc_type == FG_GC && seg_freed == sbi->segs_per_sec)
 		sec_freed++;
 	total_freed += seg_freed;
@@ -1965,7 +1974,7 @@ gc_more:
 	if (gc_type == FG_GC && seg_freed)
 		sbi->cur_victim_sec = NULL_SEGNO;
 
-	if (sync)
+	if (gc_control->init_gc_type == FG_GC)
 		goto stop;
 
 	if (has_not_enough_free_secs(sbi, sec_freed, 0)) {
@@ -1987,7 +1996,7 @@ gc_more:
 	}
 stop:
 	SIT_I(sbi)->last_victim[ALLOC_NEXT] = 0;
-	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = init_segno;
+	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = gc_control->victim_segno;
 
 	trace_f2fs_gc_end(sb, ret, total_freed, sec_freed,
 				get_pages(sbi, F2FS_DIRTY_NODES),
@@ -2002,7 +2011,7 @@ stop:
 
 	put_gc_inode(&gc_list);
 
-	if (sync && !ret)
+	if (gc_control->err_gc_skipped && !ret)
 		ret = sec_freed ? 0 : -EAGAIN;
 
 	if (gc_type == FG_GC && down_read_trylock(&sb->s_umount)) {
