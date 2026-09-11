@@ -4405,6 +4405,13 @@ static int build_sit_entries(struct f2fs_sb_info *sbi)
 			if (err)
 				return err;
 			seg_info_from_raw_sit(se, &sit);
+
+			if (se->type >= NR_PERSISTENT_LOG) {
+				f2fs_err(sbi, "Invalid segment type: %u, segno: %u",
+							se->type, start);
+				return -EFSCORRUPTED;
+			}
+
 			if (IS_NODESEG(se->type))
 				total_node_blocks += se->valid_blocks;
 
@@ -4451,6 +4458,14 @@ static int build_sit_entries(struct f2fs_sb_info *sbi)
 		if (err)
 			break;
 		seg_info_from_raw_sit(se, &sit);
+
+		if (se->type >= NR_PERSISTENT_LOG) {
+			f2fs_err(sbi, "Invalid segment type: %u, segno: %u",
+							se->type, start);
+			err = -EFSCORRUPTED;
+			break;
+		}
+
 		if (IS_NODESEG(se->type))
 			total_node_blocks += se->valid_blocks;
 
