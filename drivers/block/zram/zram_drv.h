@@ -62,6 +62,15 @@ enum zram_pageflags {
 	__NR_ZRAM_PAGEFLAGS,
 };
 
+/*
+ * The upper bits of table[index].flags count how many idle-marking
+ * generations a page has survived.
+ */
+#define ZRAM_IDLE_COUNT_SHIFT	__NR_ZRAM_PAGEFLAGS
+#define ZRAM_IDLE_COUNT_MAX	10
+#define ZRAM_IDLE_COUNT_BITS	4
+#define ZRAM_IDLE_COUNT_MASK	(((1UL << ZRAM_IDLE_COUNT_BITS) - 1) << 				 ZRAM_IDLE_COUNT_SHIFT)
+
 /*-- Data structures */
 
 /* Allocated for each disk page */
@@ -146,4 +155,22 @@ struct zram {
 	struct dentry *debugfs_dir;
 #endif
 };
+
+static inline unsigned int zram_idle_count(struct zram *zram, u32 index)
+{
+	return zram->table[index].flags >> ZRAM_IDLE_COUNT_SHIFT;
+}
+
+static inline void zram_clear_idle_count(struct zram *zram, u32 index)
+{
+	zram->table[index].flags &= ~ZRAM_IDLE_COUNT_MASK;
+}
+
+static inline void zram_inc_idle_count(struct zram *zram, u32 index)
+{
+	unsigned int count = zram_idle_count(zram, index);
+
+	if (count < ZRAM_IDLE_COUNT_MAX)
+		zram->table[index].flags += BIT(ZRAM_IDLE_COUNT_SHIFT);
+}
 #endif

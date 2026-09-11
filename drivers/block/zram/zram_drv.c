@@ -147,9 +147,10 @@ static inline void zram_set_priority(struct zram *zram, u32 index, u32 prio)
 	 * Clear previous priority value first, in case if we recompress
 	 * further an already recompressed page
 	 */
-	zram->table[index].flags &= ~(ZRAM_COMP_PRIORITY_MASK <<
+	zram->table[index].flags &= ~((unsigned long)ZRAM_COMP_PRIORITY_MASK <<
 				      ZRAM_COMP_PRIORITY_BIT1);
-	zram->table[index].flags |= (prio << ZRAM_COMP_PRIORITY_BIT1);
+	zram->table[index].flags |= ((unsigned long)prio <<
+				      ZRAM_COMP_PRIORITY_BIT1);
 }
 
 static inline u32 zram_get_priority(struct zram *zram, u32 index)
@@ -335,8 +336,10 @@ static ssize_t idle_store(struct device *dev,
 		 */
 		zram_slot_lock(zram, index);
 		if (zram_allocated(zram, index) &&
-				!zram_test_flag(zram, index, ZRAM_UNDER_WB))
+				!zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+			zram_inc_idle_count(zram, index);
 			zram_set_flag(zram, index, ZRAM_IDLE);
+		}
 		zram_slot_unlock(zram, index);
 
 		cond_resched();
@@ -1295,6 +1298,84 @@ static ssize_t low_compress_ratio_store(struct device *dev,
 	return len;
 }
 
+static ssize_t new_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long index;
+
+	if (!sysfs_streq(buf, "all"))
+		return -EINVAL;
+
+	down_read(&zram->init_lock);
+	if (!init_done(zram)) {
+		up_read(&zram->init_lock);
+		return -EINVAL;
+	}
+
+	for (index = 0; index < nr_pages; index++) {
+		zram_slot_lock(zram, index);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_clear_idle_count(zram, index);
+		zram_slot_unlock(zram, index);
+	}
+	up_read(&zram->init_lock);
+
+	return len;
+}
+
+static ssize_t idle_stat_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	unsigned long counts[ZRAM_IDLE_COUNT_MAX + 1] = { 0 };
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long index;
+	size_t len = 0;
+
+	down_read(&zram->init_lock);
+	for (index = 0; index < nr_pages; index++) {
+		unsigned int count;
+
+		zram_slot_lock(zram, index);
+		if (zram_allocated(zram, index)) {
+			count = zram_idle_count(zram, index);
+			if (count <= ZRAM_IDLE_COUNT_MAX)
+				counts[count]++;
+		}
+		zram_slot_unlock(zram, index);
+	}
+	up_read(&zram->init_lock);
+
+	for (index = 1; index <= ZRAM_IDLE_COUNT_MAX; index++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%lu%s",
+				counts[index],
+				index == ZRAM_IDLE_COUNT_MAX ? "\n" : " ");
+	return len;
+}
+
+static ssize_t new_stat_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	unsigned long count = 0;
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long index;
+
+	down_read(&zram->init_lock);
+	for (index = 0; index < nr_pages; index++) {
+		zram_slot_lock(zram, index);
+		if (zram_allocated(zram, index) &&
+				!zram_idle_count(zram, index))
+			count++;
+		zram_slot_unlock(zram, index);
+	}
+	up_read(&zram->init_lock);
+
+	return scnprintf(buf, PAGE_SIZE, "%lu\n", count);
+}
+
 #ifdef CONFIG_ZRAM_WRITEBACK
 #define FOUR_K(x) ((x) * (1 << (PAGE_SHIFT - 12)))
 static ssize_t bd_stat_show(struct device *dev,
@@ -1387,6 +1468,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 #endif
 	if (zram_test_flag(zram, index, ZRAM_IDLE))
 		zram_clear_flag(zram, index, ZRAM_IDLE);
+	zram_clear_idle_count(zram, index);
 
 	if (zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
 		zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE);
@@ -2396,6 +2478,9 @@ static DEVICE_ATTR_WO(reset);
 static DEVICE_ATTR_WO(mem_limit);
 static DEVICE_ATTR_WO(mem_used_max);
 static DEVICE_ATTR_WO(idle);
+static DEVICE_ATTR_WO(new);
+static DEVICE_ATTR_RO(idle_stat);
+static DEVICE_ATTR_RO(new_stat);
 static DEVICE_ATTR_RW(low_compress_ratio);
 static DEVICE_ATTR_RW(max_comp_streams);
 static DEVICE_ATTR_RW(comp_algorithm);
@@ -2418,6 +2503,9 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_mem_limit.attr,
 	&dev_attr_mem_used_max.attr,
 	&dev_attr_idle.attr,
+	&dev_attr_new.attr,
+	&dev_attr_idle_stat.attr,
+	&dev_attr_new_stat.attr,
 	&dev_attr_low_compress_ratio.attr,
 	&dev_attr_max_comp_streams.attr,
 	&dev_attr_comp_algorithm.attr,
