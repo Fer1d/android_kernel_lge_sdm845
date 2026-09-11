@@ -141,6 +141,8 @@ enum {
 	Opt_checkpoint_disable_cap_perc,
 	Opt_checkpoint_enable,
 	Opt_atgc,
+	Opt_gc_merge,
+	Opt_nogc_merge,
 	Opt_err,
 };
 
@@ -204,6 +206,8 @@ static match_table_t f2fs_tokens = {
 	{Opt_checkpoint_disable_cap_perc, "checkpoint=disable:%u%%"},
 	{Opt_checkpoint_enable, "checkpoint=enable"},
 	{Opt_atgc, "atgc"},
+	{Opt_gc_merge, "gc_merge"},
+	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_err, NULL},
 };
 
@@ -796,6 +800,12 @@ static int parse_options(struct super_block *sb, char *options)
 		case Opt_atgc:
 			set_opt(sbi, ATGC);
 			break;
+		case Opt_gc_merge:
+			set_opt(sbi, GC_MERGE);
+			break;
+		case Opt_nogc_merge:
+			clear_opt(sbi, GC_MERGE);
+			break;
 		default:
 			f2fs_err(sbi, "Unrecognized mount option \"%s\" or missing value",
 				 p);
@@ -1333,6 +1343,10 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	} else {
 		seq_printf(seq, ",background_gc=%s", "off");
 	}
+
+	if (test_opt(sbi, GC_MERGE))
+		seq_puts(seq, ",gc_merge");
+
 	if (test_opt(sbi, DISABLE_ROLL_FORWARD))
 		seq_puts(seq, ",disable_roll_forward");
 	if (test_opt(sbi, DISCARD))
@@ -1681,7 +1695,8 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 	 * or if background_gc = off is passed in mount
 	 * option. Also sync the filesystem.
 	 */
-	if ((*flags & MS_RDONLY) || !test_opt(sbi, BG_GC)) {
+	if ((*flags & MS_RDONLY) ||
+			(!test_opt(sbi, BG_GC) && !test_opt(sbi, GC_MERGE))) {
 		if (sbi->gc_thread) {
 			f2fs_stop_gc_thread(sbi);
 			need_restart_gc = true;
@@ -3531,7 +3546,8 @@ reset_checkpoint:
 	 * If filesystem is not mounted as read-only then
 	 * do start the gc_thread.
 	 */
-	if (test_opt(sbi, BG_GC) && !f2fs_readonly(sb)) {
+	if ((test_opt(sbi, BG_GC) || test_opt(sbi, GC_MERGE)) &&
+							!f2fs_readonly(sb)) {
 		/* After POR, we can run background GC thread.*/
 		err = f2fs_start_gc_thread(sbi);
 		if (err)
