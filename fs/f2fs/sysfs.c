@@ -372,6 +372,8 @@ out:
 					&sbi->gc_thread->gc_wait_queue_head);
 				wake_up_discard_thread(sbi, true);
 			}
+		} else if (t == 2) {
+			sbi->gc_mode = GC_URGENT_LOW;
 		} else {
 			sbi->gc_mode = GC_NORMAL;
 		}

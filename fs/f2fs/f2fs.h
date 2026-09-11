@@ -2331,6 +2331,10 @@ static inline bool is_idle(struct f2fs_sb_info *sbi, int type)
 			atomic_read(&SM_I(sbi)->fcc_info->queued_flush))
 		return false;
 
+	if (sbi->gc_mode == GC_URGENT_LOW &&
+			(type == DISCARD_TIME || type == GC_TIME))
+		return true;
+
 	return f2fs_time_over(sbi, type);
 }
 
