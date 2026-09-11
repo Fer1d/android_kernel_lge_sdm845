@@ -2356,6 +2356,11 @@ do_more:
 
 	gc_control.victim_segno = GET_SEGNO(sbi, range.start);
 	ret = f2fs_gc(sbi, &gc_control);
+	if (ret) {
+		if (ret == -EBUSY)
+			ret = -EAGAIN;
+		goto out;
+	}
 	range.start += BLKS_PER_SEC(sbi);
 	if (range.start <= end)
 		goto do_more;
