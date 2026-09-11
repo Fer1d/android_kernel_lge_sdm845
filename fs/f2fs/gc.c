@@ -168,6 +168,8 @@ do_gc:
 		gc_control.init_gc_type = (sbi->rapid_gc ||
 				test_opt(sbi, FORCE_FG_GC)) ? FG_GC : BG_GC;
 		gc_control.no_bg_gc = false;
+		gc_control.nr_free_secs =
+				(gc_control.init_gc_type == FG_GC) ? 1 : 0;
 
 		/* if return value is not zero, no victim was selected */
 		if (f2fs_gc(sbi, &gc_control)) {
@@ -1908,6 +1910,7 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 	unsigned int skipped_round = 0, round = 0;
 
 	trace_f2fs_gc_begin(sb, gc_type, gc_control->no_bg_gc,
+				gc_control->nr_free_secs,
 				get_pages(sbi, F2FS_DIRTY_NODES),
 				get_pages(sbi, F2FS_DIRTY_DENTS),
 				get_pages(sbi, F2FS_DIRTY_IMETA),
@@ -1972,26 +1975,32 @@ gc_more:
 	if (gc_type == FG_GC && seg_freed)
 		sbi->cur_victim_sec = NULL_SEGNO;
 
-	if (gc_control->init_gc_type == FG_GC)
+	if (gc_control->init_gc_type == FG_GC ||
+			!has_not_enough_free_secs(sbi,
+					(gc_type == FG_GC) ? sec_freed : 0, 0)) {
+		if (gc_type == FG_GC && sec_freed < gc_control->nr_free_secs)
+			goto go_gc_more;
 		goto stop;
-
-	if (has_not_enough_free_secs(sbi, sec_freed, 0)) {
-		if (skipped_round <= MAX_SKIP_GC_COUNT ||
-					skipped_round * 2 < round) {
-			segno = NULL_SEGNO;
-			goto gc_more;
-		}
-
-		if (first_skipped < last_skipped &&
-				(last_skipped - first_skipped) >
-						sbi->skipped_gc_rwsem) {
-			f2fs_drop_inmem_pages_all(sbi, true);
-			segno = NULL_SEGNO;
-			goto gc_more;
-		}
-		if (gc_type == FG_GC && !is_sbi_flag_set(sbi, SBI_CP_DISABLED))
-			ret = f2fs_write_checkpoint(sbi, &cpc);
 	}
+
+	if (skipped_round <= MAX_SKIP_GC_COUNT ||
+				skipped_round * 2 < round) {
+		segno = NULL_SEGNO;
+		goto gc_more;
+	}
+
+	if (first_skipped < last_skipped &&
+			(last_skipped - first_skipped) >
+					sbi->skipped_gc_rwsem) {
+		f2fs_drop_inmem_pages_all(sbi, true);
+		segno = NULL_SEGNO;
+		goto gc_more;
+	}
+	if (gc_type == FG_GC && !is_sbi_flag_set(sbi, SBI_CP_DISABLED))
+		ret = f2fs_write_checkpoint(sbi, &cpc);
+go_gc_more:
+	segno = NULL_SEGNO;
+	goto gc_more;
 stop:
 	SIT_I(sbi)->last_victim[ALLOC_NEXT] = 0;
 	SIT_I(sbi)->last_victim[FLUSH_DEVICE] = gc_control->victim_segno;
