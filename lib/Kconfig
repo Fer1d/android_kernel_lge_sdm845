@@ -243,16 +243,22 @@ config LZ4
 config LZ4HC
 	tristate
 
-config LZ4K_COMPRESS
+config LZ4_COMPRESS
 	tristate
 
-config LZ4KD_COMPRESS
+config LZ4HC_COMPRESS
+	tristate
+
+config LZ4K_COMPRESS
 	tristate
 
 config LZ4_DECOMPRESS
 	tristate
 
 config LZ4K_DECOMPRESS
+	tristate
+
+config LZ4KD_COMPRESS
 	tristate
 
 config LZ4KD_DECOMPRESS
