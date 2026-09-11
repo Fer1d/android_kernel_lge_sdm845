@@ -147,3 +147,25 @@ Description:
 		a compressed page is counted as poorly compressed and
 		reported as the tenth field of mm_stat. The default is 75;
 		setting it to 0 disables the accounting.
+
+What:		/sys/block/zram<id>/idle_stat
+Date:		May 2025
+Contact:	Fer1d
+Description:
+		The idle_stat file is read-only and reports, for pages that
+		survived 1..10 idle markings, how many pages fall into each
+		generation. A page that is written again starts over.
+
+What:		/sys/block/zram<id>/new_stat
+Date:		May 2025
+Contact:	Fer1d
+Description:
+		The new_stat file is read-only and reports the number of
+		allocated pages that have not been marked idle yet.
+
+What:		/sys/block/zram<id>/new
+Date:		May 2025
+Contact:	Fer1d
+Description:
+		The new file is write-only; writing "all" clears the idle
+		state and the idle generation counter of every page.
