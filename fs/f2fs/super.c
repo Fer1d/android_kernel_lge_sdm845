@@ -3288,6 +3288,7 @@ try_onemore:
 	/* disallow all the data/node/meta page writes */
 	set_sbi_flag(sbi, SBI_POR_DOING);
 	spin_lock_init(&sbi->stat_lock);
+	spin_lock_init(&sbi->gc_urgent_high_lock);
 
 	/* init iostat info */
 	spin_lock_init(&sbi->iostat_lock);
