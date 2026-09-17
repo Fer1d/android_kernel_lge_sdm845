@@ -67,6 +67,25 @@
 				fsmgr_flags = "wait,formattable";
 				status = "ok";
 			};
+
+			OP {
+				compatible = "android,op";
+				dev = "/dev/block/platform/soc/1d84000.ufshc/by-name/OP";
+				type = "ext4";
+				mnt_point = "/oem/OP";
+				/*
+				 * The OP partition is formatted without a journal, and
+				 * ext4 refuses to mount a journal-less filesystem when a
+				 * data= mode is given on the command line
+				 * ("can't mount with data=, fs mounted w/o journal",
+				 * fs/ext4/super.c), which left /oem/OP unmounted while
+				 * nofail kept the boot going. Keep this list free of
+				 * data=, as the ramdisk fstab already is.
+				 */
+				mnt_flags = "ro,noatime,nosuid,nodev,barrier=1,noauto_da_alloc";
+				fsmgr_flags = "wait,slotselect,avb,nofail";
+				status = "ok";
+			};
 		};
 	};
 };
