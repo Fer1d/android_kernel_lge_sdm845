@@ -15,6 +15,8 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/kobject.h>
+#include <linux/completion.h>
 #include "erofs_fs.h"
 
 /* redefine pr_fmt "erofs: " */
@@ -54,6 +56,10 @@ struct erofs_sb_lz4_info {
 };
 
 struct erofs_sb_info {
+	/* sysfs support */
+	struct kobject s_kobj;
+	struct completion s_kobj_unregister;
+
 #ifdef CONFIG_EROFS_FS_ZIP
 	/* list for all registered superblocks, mainly for shrinker */
 	struct list_head list;
@@ -463,5 +469,11 @@ static inline int z_erofs_load_lz4_config(struct super_block *sb,
 #ifndef lru_to_page
 #define lru_to_page(head) (list_entry((head)->prev, struct page, lru))
 #endif
+
+/* sysfs.c */
+int erofs_register_sysfs(struct super_block *sb);
+void erofs_unregister_sysfs(struct super_block *sb);
+int __init erofs_init_sysfs(void);
+void erofs_exit_sysfs(void);
 
 #endif	/* __EROFS_INTERNAL_H */

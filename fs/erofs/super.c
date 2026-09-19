@@ -596,6 +596,13 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 	if (err)
 		return err;
 
+	err = erofs_register_sysfs(sb);
+	if (err) {
+		/* 统计功能不该拖垮开机关键路径 */
+		erofs_err(sb, "failed to register sysfs: %d", err);
+		err = 0;
+	}
+
 	erofs_info(sb, "mounted with opts: %s, root inode @ nid %llu.",
 		   (char *)data, ROOT_NID(sbi));
 	return 0;
@@ -622,6 +629,8 @@ static void erofs_kill_sb(struct super_block *sb)
 	sbi = EROFS_SB(sb);
 	if (!sbi)
 		return;
+
+	erofs_unregister_sysfs(sb);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 }
@@ -673,6 +682,10 @@ static int __init erofs_module_init(void)
 	if (err)
 		goto zip_err;
 
+	err = erofs_init_sysfs();
+	if (err)
+		goto fs_err;
+
 	err = register_filesystem(&erofs_fs_type);
 	if (err)
 		goto fs_err;
@@ -680,6 +693,7 @@ static int __init erofs_module_init(void)
 	return 0;
 
 fs_err:
+	erofs_exit_sysfs();
 	z_erofs_exit_zip_subsystem();
 zip_err:
 	erofs_exit_shrinker();
@@ -692,6 +706,7 @@ icache_err:
 static void __exit erofs_module_exit(void)
 {
 	unregister_filesystem(&erofs_fs_type);
+	erofs_exit_sysfs();
 	z_erofs_exit_zip_subsystem();
 	erofs_exit_shrinker();
 
