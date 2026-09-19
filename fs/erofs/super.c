@@ -115,6 +115,9 @@ static bool check_layout_compatibility(struct super_block *sb,
 	const unsigned int feature = le32_to_cpu(dsb->feature_incompat);
 
 	EROFS_SB(sb)->feature_incompat = feature;
+	/* 4.9 的挂载项解析在 read_superblock 之后，设备表信息先存进 sbi */
+	EROFS_SB(sb)->devt_slotoff = le16_to_cpu(dsb->devt_slotoff);
+	EROFS_SB(sb)->ondisk_extra_devices = le16_to_cpu(dsb->extra_devices);
 
 	/* check if current kernel meets all mandatory requirements */
 	if (feature & (~EROFS_ALL_FEATURE_INCOMPAT)) {
@@ -311,6 +314,8 @@ static int erofs_read_superblock(struct super_block *sb)
 		goto out;
 	}
 	sbi->blocks = le32_to_cpu(dsb->blocks);
+	sbi->primarydevice_blocks = sbi->blocks;
+	sbi->total_blocks = sbi->blocks;
 	sbi->meta_blkaddr = le32_to_cpu(dsb->meta_blkaddr);
 #ifdef CONFIG_EROFS_FS_XATTR
 	sbi->xattr_blkaddr = le32_to_cpu(dsb->xattr_blkaddr);
@@ -399,6 +404,7 @@ enum {
 	Opt_acl,
 	Opt_noacl,
 	Opt_cache_strategy,
+	Opt_device,
 	Opt_err
 };
 
@@ -408,8 +414,120 @@ static match_table_t erofs_tokens = {
 	{Opt_acl, "acl"},
 	{Opt_noacl, "noacl"},
 	{Opt_cache_strategy, "cache_strategy=%s"},
+	{Opt_device, "device=%s"},
 	{Opt_err, NULL}
 };
+
+static int erofs_init_devices(struct super_block *sb)
+{
+	struct erofs_sb_info *sbi = EROFS_SB(sb);
+	unsigned int ondisk_extradevs;
+	erofs_off_t pos;
+	struct page *page = NULL;
+	struct erofs_device_info *dif;
+	struct erofs_deviceslot *dis;
+	void *ptr;
+	int id, err = 0;
+
+	sbi->total_blocks = sbi->primarydevice_blocks;
+	ondisk_extradevs = erofs_sb_has_device_table(sbi) ?
+		sbi->ondisk_extra_devices : 0;
+
+	if (ondisk_extradevs != sbi->devs->extra_devices) {
+		erofs_err(sb, "extra devices don't match (ondisk %u, given %u)",
+			  ondisk_extradevs, sbi->devs->extra_devices);
+		return -EINVAL;
+	}
+	if (!ondisk_extradevs)
+		return 0;
+
+	sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+	pos = (erofs_off_t)sbi->devt_slotoff * EROFS_DEVT_SLOT_SIZE;
+	down_read(&sbi->devs->rwsem);
+	idr_for_each_entry(&sbi->devs->tree, dif, id) {
+		erofs_blk_t blk = erofs_blknr(pos);
+		struct block_device *bdev;
+
+		if (!page || page->index != blk) {
+			if (page) {
+				kunmap(page);
+				unlock_page(page);
+				put_page(page);
+			}
+			page = erofs_get_meta_page(sb, blk);
+			if (IS_ERR(page)) {
+				up_read(&sbi->devs->rwsem);
+				return PTR_ERR(page);
+			}
+			ptr = kmap(page);
+		}
+		dis = ptr + erofs_blkoff(pos);
+
+		bdev = blkdev_get_by_path(dif->path, FMODE_READ | FMODE_EXCL,
+					  sb->s_type);
+		if (IS_ERR(bdev)) {
+			err = PTR_ERR(bdev);
+			goto err_out;
+		}
+		dif->bdev = bdev;
+		dif->blocks = le32_to_cpu(dis->blocks);
+		dif->mapped_blkaddr = le32_to_cpu(dis->mapped_blkaddr);
+		sbi->total_blocks += dif->blocks;
+		pos += EROFS_DEVT_SLOT_SIZE;
+	}
+err_out:
+	up_read(&sbi->devs->rwsem);
+	if (page) {
+		kunmap(page);
+		unlock_page(page);
+		put_page(page);
+	}
+	return err;
+}
+
+static int erofs_add_device(struct erofs_sb_info *sbi, const char *path)
+{
+	struct erofs_device_info *dif;
+	int id;
+
+	dif = kzalloc(sizeof(*dif), GFP_KERNEL);
+	if (!dif)
+		return -ENOMEM;
+	dif->path = kstrdup(path, GFP_KERNEL);
+	if (!dif->path) {
+		kfree(dif);
+		return -ENOMEM;
+	}
+
+	down_write(&sbi->devs->rwsem);
+	id = idr_alloc(&sbi->devs->tree, dif, 0, 0, GFP_KERNEL);
+	up_write(&sbi->devs->rwsem);
+	if (id < 0) {
+		kfree(dif->path);
+		kfree(dif);
+		return id;
+	}
+	sbi->devs->extra_devices++;
+	return 0;
+}
+
+static void erofs_free_dev_context(struct erofs_dev_context *devs)
+{
+	struct erofs_device_info *dif;
+	int id;
+
+	if (!devs)
+		return;
+	idr_for_each_entry(&devs->tree, dif, id) {
+		if (dif->bdev)
+			blkdev_put(dif->bdev, FMODE_READ | FMODE_EXCL);
+		kfree(dif->path);
+		idr_remove(&devs->tree, id);
+		kfree(dif);
+	}
+	idr_destroy(&devs->tree);
+	kfree(devs);
+}
 
 static int erofs_parse_options(struct super_block *sb, char *options)
 {
@@ -460,6 +578,13 @@ static int erofs_parse_options(struct super_block *sb, char *options)
 			erofs_info(sb, "noacl options not supported");
 			break;
 #endif
+		case Opt_device:
+			err = erofs_add_device(EROFS_SB(sb), args[0].from);
+			if (err) {
+				erofs_err(sb, "failed to add device %s", args[0].from);
+				return err;
+			}
+			break;
 		case Opt_cache_strategy:
 			err = erofs_build_cache_strategy(sb, args);
 			if (err)
@@ -550,6 +675,12 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENOMEM;
 
 	sb->s_fs_info = sbi;
+	sbi->devs = kzalloc(sizeof(struct erofs_dev_context), GFP_KERNEL);
+	if (!sbi->devs)
+		return -ENOMEM;
+	idr_init(&sbi->devs->tree);
+	init_rwsem(&sbi->devs->rwsem);
+
 	err = erofs_read_superblock(sb);
 	if (err)
 		return err;
@@ -565,6 +696,10 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 	erofs_default_options(sbi);
 
 	err = erofs_parse_options(sb, data);
+	if (err)
+		return err;
+
+	err = erofs_init_devices(sb);
 	if (err)
 		return err;
 
@@ -635,6 +770,8 @@ static void erofs_kill_sb(struct super_block *sb)
 		return;
 
 	erofs_unregister_sysfs(sb);
+	erofs_free_dev_context(sbi->devs);
+	sbi->devs = NULL;
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 }

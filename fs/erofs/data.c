@@ -133,6 +133,32 @@ static inline struct bio *erofs_read_raw_page(struct bio *bio,
 	if (bio &&
 	    /* not continuous */
 	    *last_block + 1 != current_block) {
+
+	/*
+	 * 多设备（DEVICE_TABLE）下，逻辑上连续的两个 chunk 可能落在不同设备，
+	 * 复用已建好的 bio 之前必须确认设备一致。单设备镜像 extra_devices 为 0，
+	 * 这里零开销。
+	 */
+	if (bio && EROFS_SB(sb)->devs && EROFS_SB(sb)->devs->extra_devices) {
+		struct erofs_map_blocks tmap = {
+			.m_la = blknr_to_addr(current_block),
+		};
+		struct erofs_map_dev tmdev;
+
+		err = erofs_map_blocks(inode, &tmap, EROFS_GET_BLOCKS_RAW);
+		if (!err) {
+			tmdev.m_deviceid = tmap.m_deviceid;
+			tmdev.m_pa = tmap.m_pa;
+			err = erofs_map_dev(sb, &tmdev);
+		}
+		if (err)
+			goto err_out;
+		if ((tmap.m_flags & EROFS_MAP_MAPPED) &&
+		    bio->bi_bdev != tmdev.m_bdev) {
+			submit_bio(bio);
+			bio = NULL;
+		}
+	}
 submit_bio_retry:
 		submit_bio(bio);
 		bio = NULL;
@@ -144,8 +170,18 @@ submit_bio_retry:
 		};
 		erofs_blk_t blknr;
 		unsigned int blkoff;
+		struct erofs_map_dev mdev;
 
 		err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW);
+		if (err)
+			goto err_out;
+
+		mdev.m_deviceid = map.m_deviceid;
+		mdev.m_pa = map.m_pa;
+		err = erofs_map_dev(sb, &mdev);
+		if (err)
+			goto err_out;
+		map.m_pa = mdev.m_pa;
 		if (err)
 			goto err_out;
 
@@ -207,7 +243,7 @@ submit_bio_retry:
 		bio = bio_alloc(GFP_NOIO, nblocks);
 
 		bio->bi_end_io = erofs_readendio;
-		bio->bi_bdev = sb->s_bdev;
+		bio->bi_bdev = mdev.m_bdev;
 		bio->bi_iter.bi_sector = (sector_t)blknr <<
 			LOG_SECTORS_PER_BLOCK;
 		bio->bi_opf = REQ_OP_READ | (ra ? REQ_RAHEAD : 0);
@@ -380,6 +416,46 @@ out_unlock:
 out:
 	map->m_llen = map->m_plen;
 	return err;
+}
+
+int erofs_map_dev(struct super_block *sb, struct erofs_map_dev *map)
+{
+	struct erofs_dev_context *devs = EROFS_SB(sb)->devs;
+	struct erofs_device_info *dif;
+	int id;
+
+	/* primary device by default */
+	map->m_bdev = sb->s_bdev;
+
+	if (map->m_deviceid) {
+		down_read(&devs->rwsem);
+		dif = idr_find(&devs->tree, map->m_deviceid - 1);
+		if (!dif) {
+			up_read(&devs->rwsem);
+			return -ENODEV;
+		}
+		map->m_bdev = dif->bdev;
+		up_read(&devs->rwsem);
+	} else if (devs->extra_devices) {
+		down_read(&devs->rwsem);
+		idr_for_each_entry(&devs->tree, dif, id) {
+			erofs_off_t startoff, length;
+
+			if (!dif->mapped_blkaddr)
+				continue;
+			startoff = blknr_to_addr(dif->mapped_blkaddr);
+			length = blknr_to_addr(dif->blocks);
+
+			if (map->m_pa >= startoff &&
+			    map->m_pa < startoff + length) {
+				map->m_pa -= startoff;
+				map->m_bdev = dif->bdev;
+						break;
+			}
+		}
+		up_read(&devs->rwsem);
+	}
+	return 0;
 }
 
 static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
