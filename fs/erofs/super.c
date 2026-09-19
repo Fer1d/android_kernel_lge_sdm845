@@ -818,6 +818,10 @@ static int __init erofs_module_init(void)
 	if (err)
 		goto shrinker_err;
 
+	err = z_erofs_lzma_init();
+	if (err)
+		goto lzma_err;
+
 	erofs_pcpubuf_init();
 	err = z_erofs_init_zip_subsystem();
 	if (err)
@@ -837,6 +841,8 @@ fs_err:
 	erofs_exit_sysfs();
 	z_erofs_exit_zip_subsystem();
 zip_err:
+	z_erofs_lzma_exit();
+lzma_err:
 	erofs_exit_shrinker();
 shrinker_err:
 	kmem_cache_destroy(erofs_inode_cachep);
@@ -849,6 +855,7 @@ static void __exit erofs_module_exit(void)
 	unregister_filesystem(&erofs_fs_type);
 	erofs_exit_sysfs();
 	z_erofs_exit_zip_subsystem();
+	z_erofs_lzma_exit();
 	erofs_exit_shrinker();
 
 	/* Ensure all RCU free inodes are safe before cache is destroyed. */
@@ -866,7 +873,7 @@ static int erofs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = EROFS_BLKSIZ;
-	buf->f_blocks = sbi->blocks;
+	buf->f_blocks = sbi->total_blocks;
 	buf->f_bfree = buf->f_bavail = 0;
 
 	buf->f_files = ULLONG_MAX;
