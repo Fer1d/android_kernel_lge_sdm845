@@ -240,7 +240,7 @@ static DEFINE_MUTEX(z_pagemap_global_lock);
 static void preload_compressed_pages(struct z_erofs_collector *clt,
 				     struct address_space *mc,
 				     enum z_erofs_cache_alloctype type,
-				     struct list_head *pagepool)
+				     struct page **pagepool)
 {
 	struct z_erofs_pcluster *pcl = clt->pcl;
 	bool standalone = true;
@@ -291,7 +291,7 @@ static void preload_compressed_pages(struct z_erofs_collector *clt,
 			put_page(page);
 		} else if (newpage) {
 			set_page_private(newpage, 0);
-			list_add(&newpage->lru, pagepool);
+			erofs_pagepool_add(pagepool, newpage);
 		}
 	}
 
@@ -644,7 +644,7 @@ static bool should_alloc_managed_pages(struct z_erofs_decompress_frontend *fe,
 }
 
 static int z_erofs_do_read_page(struct z_erofs_decompress_frontend *fe,
-				struct page *page, struct list_head *pagepool)
+				struct page *page, struct page **pagepool)
 {
 	struct inode *const inode = fe->inode;
 	struct erofs_sb_info *const sbi = EROFS_I_SB(inode);
@@ -831,7 +831,7 @@ static void z_erofs_decompressqueue_endio(struct bio *bio)
 
 static int z_erofs_decompress_pcluster(struct super_block *sb,
 				       struct z_erofs_pcluster *pcl,
-				       struct list_head *pagepool)
+				       struct page **pagepool)
 {
 	struct erofs_sb_info *const sbi = EROFS_SB(sb);
 	struct z_erofs_pagevec_ctor ctor;
@@ -1031,7 +1031,7 @@ out:
 }
 
 static void z_erofs_decompress_queue(const struct z_erofs_decompressqueue *io,
-				     struct list_head *pagepool)
+				     struct page **pagepool)
 {
 	z_erofs_next_pcluster_t owned = io->head;
 
@@ -1055,18 +1055,18 @@ static void z_erofs_decompressqueue_work(struct work_struct *work)
 {
 	struct z_erofs_decompressqueue *bgq =
 		container_of(work, struct z_erofs_decompressqueue, u.work);
-	LIST_HEAD(pagepool);
+	struct page *pagepool = NULL;
 
 	DBG_BUGON(bgq->head == Z_EROFS_PCLUSTER_TAIL_CLOSED);
 	z_erofs_decompress_queue(bgq, &pagepool);
 
-	put_pages_list(&pagepool);
+	erofs_release_pages(&pagepool);
 	kvfree(bgq);
 }
 
 static struct page *pickup_page_for_submission(struct z_erofs_pcluster *pcl,
 					       unsigned int nr,
-					       struct list_head *pagepool,
+					       struct page **pagepool,
 					       struct address_space *mc,
 					       gfp_t gfp)
 {
@@ -1159,7 +1159,7 @@ repeat:
 out_allocpage:
 	page = erofs_allocpage(pagepool, gfp | __GFP_NOFAIL);
 	if (oldpage != cmpxchg(&pcl->compressed_pages[nr], oldpage, page)) {
-		list_add(&page->lru, pagepool);
+		erofs_pagepool_add(pagepool, page);
 		cond_resched();
 		goto repeat;
 	}
@@ -1242,7 +1242,7 @@ static void move_to_bypass_jobqueue(struct z_erofs_pcluster *pcl,
 
 static void z_erofs_submit_queue(struct super_block *sb,
 				 struct z_erofs_decompress_frontend *f,
-				 struct list_head *pagepool,
+				 struct page **pagepool,
 				 struct z_erofs_decompressqueue *fgq,
 				 bool *force_fg)
 {
@@ -1340,7 +1340,7 @@ submit_bio_retry:
 
 static void z_erofs_runqueue(struct super_block *sb,
 			     struct z_erofs_decompress_frontend *f,
-			     struct list_head *pagepool, bool force_fg)
+			     struct page **pagepool, bool force_fg)
 {
 	struct z_erofs_decompressqueue io[NR_JOBQUEUES];
 
@@ -1366,7 +1366,7 @@ static int z_erofs_readpage(struct file *file, struct page *page)
 	struct inode *const inode = page->mapping->host;
 	struct z_erofs_decompress_frontend f = DECOMPRESS_FRONTEND_INIT(inode);
 	int err;
-	LIST_HEAD(pagepool);
+	struct page *pagepool = NULL;
 
 	trace_erofs_readpage(page, false);
 
@@ -1385,7 +1385,7 @@ static int z_erofs_readpage(struct file *file, struct page *page)
 		put_page(f.map.mpage);
 
 	/* clean up the remaining free pages */
-	put_pages_list(&pagepool);
+	erofs_release_pages(&pagepool);
 	return err;
 }
 
@@ -1399,7 +1399,7 @@ static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
 	struct z_erofs_decompress_frontend f = DECOMPRESS_FRONTEND_INIT(inode);
 	gfp_t gfp = mapping_gfp_constraint(mapping, GFP_KERNEL);
 	struct page *head = NULL;
-	LIST_HEAD(pagepool);
+	struct page *pagepool = NULL;
 
 	trace_erofs_readpages(mapping->host, lru_to_page(pages),
 			      nr_pages, false);
@@ -1420,7 +1420,7 @@ static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
 		sync &= !(PageReadahead(page) && !head);
 
 		if (add_to_page_cache_lru(page, mapping, page->index, gfp)) {
-			list_add(&page->lru, &pagepool);
+			erofs_pagepool_add(&pagepool, page);
 			continue;
 		}
 
@@ -1451,7 +1451,7 @@ static int z_erofs_readpages(struct file *filp, struct address_space *mapping,
 		put_page(f.map.mpage);
 
 	/* clean up the remaining free pages */
-	put_pages_list(&pagepool);
+	erofs_release_pages(&pagepool);
 	return 0;
 }
 

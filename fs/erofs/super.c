@@ -12,6 +12,7 @@
 #include "xattr.h"
 
 #define CREATE_TRACE_POINTS
+#include "internal.h"
 #include <trace/events/erofs.h>
 
 static struct kmem_cache *erofs_inode_cachep __read_mostly;
@@ -227,6 +228,9 @@ static int erofs_load_compr_cfgs(struct super_block *sb,
 		switch (alg) {
 		case Z_EROFS_COMPRESSION_LZ4:
 			ret = z_erofs_load_lz4_config(sb, dsb, data, size);
+			break;
+		case Z_EROFS_COMPRESSION_LZMA:
+			ret = z_erofs_load_lzma_config(sb, dsb, data, size);
 			break;
 		default:
 			DBG_BUGON(1);

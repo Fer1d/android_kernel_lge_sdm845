@@ -6,14 +6,23 @@
 #include "internal.h"
 #include <linux/pagevec.h>
 
-struct page *erofs_allocpage(struct list_head *pool, gfp_t gfp)
+void erofs_release_pages(struct page **pagepool)
 {
-	struct page *page;
+	while (*pagepool) {
+		struct page *page = *pagepool;
 
-	if (!list_empty(pool)) {
-		page = lru_to_page(pool);
+		*pagepool = (struct page *)page_private(page);
+		put_page(page);
+	}
+}
+
+struct page *erofs_allocpage(struct page **pagepool, gfp_t gfp)
+{
+	struct page *page = *pagepool;
+
+	if (page) {
 		DBG_BUGON(page_ref_count(page) != 1);
-		list_del(&page->lru);
+		*pagepool = (struct page *)page_private(page);
 	} else {
 		page = alloc_page(gfp);
 	}

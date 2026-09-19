@@ -18,6 +18,13 @@
 #include <linux/kobject.h>
 #include <linux/completion.h>
 #include "erofs_fs.h"
+#include <linux/fs_types.h>
+
+/* 5.15 把这两个运行期的伪算法编号放在 internal.h（旧版在 compress.h） */
+enum {
+	Z_EROFS_COMPRESSION_SHIFTED = Z_EROFS_COMPRESSION_MAX,
+	Z_EROFS_COMPRESSION_RUNTIME_MAX
+};
 
 /* redefine pr_fmt "erofs: " */
 #undef pr_fmt
@@ -329,7 +336,7 @@ extern const struct address_space_operations z_erofs_aops;
  * of the corresponding uncompressed data in the file.
  */
 enum {
-	BH_Zipped = BH_PrivateStart,
+	BH_Encoded = BH_PrivateStart,
 	BH_FullMapped,
 };
 
@@ -338,7 +345,8 @@ enum {
 /* Located in metadata (could be copied from bd_inode) */
 #define EROFS_MAP_META		(1 << BH_Meta)
 /* The extent has been compressed */
-#define EROFS_MAP_ZIPPED	(1 << BH_Zipped)
+#define EROFS_MAP_ENCODED	(1 << BH_Encoded)
+#define EROFS_MAP_ZIPPED	(1 << BH_Encoded)
 /* The length of extent is full */
 #define EROFS_MAP_FULL_MAPPED	(1 << BH_FullMapped)
 
@@ -346,6 +354,8 @@ struct erofs_map_blocks {
 	erofs_off_t m_pa, m_la;
 	u64 m_plen, m_llen;
 
+	unsigned short m_deviceid;
+	char m_algorithmformat;
 	unsigned int m_flags;
 
 	struct page *mpage;
@@ -353,6 +363,10 @@ struct erofs_map_blocks {
 
 /* Flags used by erofs_map_blocks_flatmode() */
 #define EROFS_GET_BLOCKS_RAW    0x0001
+/* 取精确解压长度（fiemap 用；本树未移植 fiemap，标志保留但不使用） */
+#define EROFS_GET_BLOCKS_FIEMAP	0x0002
+/* 请求长度不可忽略时映射整个 extent（LZMA 需要） */
+#define EROFS_GET_BLOCKS_READMORE	0x0004
 
 /* zmap.c */
 #ifdef CONFIG_EROFS_FS_ZIP
@@ -423,7 +437,6 @@ void erofs_pcpubuf_init(void);
 void erofs_pcpubuf_exit(void);
 
 /* utils.c / zdata.c */
-struct page *erofs_allocpage(struct list_head *pool, gfp_t gfp);
 
 #ifdef CONFIG_EROFS_FS_ZIP
 int erofs_workgroup_put(struct erofs_workgroup *grp);
@@ -442,6 +455,11 @@ int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
 				       struct erofs_workgroup *egrp);
 int erofs_try_to_free_cached_page(struct address_space *mapping,
 				  struct page *page);
+#ifdef CONFIG_EROFS_FS_ZIP_LZMA
+int z_erofs_load_lzma_config(struct super_block *sb,
+			    struct erofs_super_block *dsb,
+			    struct z_erofs_lzma_cfgs *lzma, int len);
+#endif
 int z_erofs_load_lz4_config(struct super_block *sb,
 			    struct erofs_super_block *dsb,
 			    struct z_erofs_lz4_cfgs *lz4, int len);
@@ -464,11 +482,27 @@ static inline int z_erofs_load_lz4_config(struct super_block *sb,
 }
 #endif	/* !CONFIG_EROFS_FS_ZIP */
 
+/* 取自 5.15 include/linux/range.h 的区间判断语义：val - start < len */
+#ifndef in_range32
+#define in_range32(val, start, len)\
+	((u32)((val) - (start)) < (u32)(len))
+#endif
+
 #define EFSCORRUPTED    EUCLEAN         /* Filesystem is corrupted */
 
 #ifndef lru_to_page
 #define lru_to_page(head) (list_entry((head)->prev, struct page, lru))
 #endif
+
+/* utils.c / zdata.c */
+struct page *erofs_allocpage(struct page **pagepool, gfp_t gfp);
+static inline void erofs_pagepool_add(struct page **pagepool,
+		struct page *page)
+{
+	set_page_private(page, (unsigned long)*pagepool);
+	*pagepool = page;
+}
+void erofs_release_pages(struct page **pagepool);
 
 /* sysfs.c */
 int erofs_register_sysfs(struct super_block *sb);

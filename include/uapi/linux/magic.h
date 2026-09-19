@@ -86,4 +86,7 @@
 #define BALLOON_KVM_MAGIC	0x13661366
 #define ZSMALLOC_MAGIC		0x58295829
 
+/* EROFS superblock magic (on-disk, fs/erofs) */
+#define EROFS_SUPER_MAGIC_V1	0xE0F5E1E2
+
 #endif /* __LINUX_MAGIC_H__ */
