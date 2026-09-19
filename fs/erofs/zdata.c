@@ -646,6 +646,11 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 	struct z_erofs_collection *cl;
 	int err;
 
+	if (!(map->m_flags & EROFS_MAP_ENCODED)) {
+		DBG_BUGON(1);
+		return -EFSCORRUPTED;
+	}
+
 	/* no available pcluster, let's allocate one */
 	pcl = z_erofs_alloc_pcluster(map->m_plen >> PAGE_SHIFT);
 	if (IS_ERR(pcl))
@@ -877,9 +882,11 @@ hitted:
 	tight &= (clt->mode >= COLLECT_PRIMARY_HOOKED &&
 		  clt->mode != COLLECT_PRIMARY_FOLLOWED_NOINPLACE);
 
-	cur = end - min_t(unsigned int, offset + end - map->m_la, end);
+	cur = end - min_t(erofs_off_t, offset + end - map->m_la, end);
 	if (!(map->m_flags & EROFS_MAP_MAPPED)) {
 		zero_user_segment(page, cur, end);
+		++spiltted;
+		tight = false;
 		goto next_part;
 	}
 
@@ -940,6 +947,12 @@ err_out:
 }
 
 static void z_erofs_decompressqueue_work(struct work_struct *work);
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+static void z_erofs_decompressqueue_kthread_work(struct kthread_work *work)
+{
+	z_erofs_decompressqueue_work((struct work_struct *)work);
+}
+#endif
 static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 				       bool sync, int bios)
 {
@@ -1366,7 +1379,12 @@ jobqueue_init(struct super_block *sb,
 			*fg = true;
 			goto fg_out;
 		}
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+		kthread_init_work(&q->u.kthread_work,
+				  z_erofs_decompressqueue_kthread_work);
+#else
 		INIT_WORK(&q->u.work, z_erofs_decompressqueue_work);
+#endif
 	} else {
 fg_out:
 		q = fgq;
@@ -1431,7 +1449,9 @@ static void z_erofs_submit_queue(struct super_block *sb,
 	z_erofs_next_pcluster_t owned_head = f->clt.owned_head;
 	/* since bio will be NULL, no need to initialize last_index */
 	pgoff_t last_index;
+	struct block_device *last_bdev = NULL;
 	unsigned int nr_bios = 0;
+	struct erofs_map_dev mdev;
 	struct bio *bio = NULL;
 
 	bi_private = jobqueueset_init(sb, q, fgq, force_fg);
@@ -1453,7 +1473,16 @@ static void z_erofs_submit_queue(struct super_block *sb,
 
 		pcl = container_of(owned_head, struct z_erofs_pcluster, next);
 
-		cur = pcl->obj.index;
+		/*
+		 * 多设备下要把 pcluster 的块号换算到实际设备：这里不带 device id，
+		 * 因此总会成功。
+		 */
+		mdev = (struct erofs_map_dev) {
+			.m_pa = blknr_to_addr(pcl->obj.index),
+		};
+		(void)erofs_map_dev(sb, &mdev);
+
+		cur = erofs_blknr(mdev.m_pa);
 		end = cur + pcl->pclusterpages;
 
 		/* close the main owned chain at first */
@@ -1469,7 +1498,8 @@ static void z_erofs_submit_queue(struct super_block *sb,
 			if (!page)
 				continue;
 
-			if (bio && cur != last_index + 1) {
+			if (bio && (cur != last_index + 1 ||
+				    last_bdev != mdev.m_bdev)) {
 submit_bio_retry:
 				submit_bio(bio);
 				bio = NULL;
@@ -1479,7 +1509,8 @@ submit_bio_retry:
 				bio = bio_alloc(GFP_NOIO, BIO_MAX_PAGES);
 
 				bio->bi_end_io = z_erofs_decompressqueue_endio;
-				bio->bi_bdev = sb->s_bdev;
+				bio->bi_bdev = mdev.m_bdev;
+				last_bdev = mdev.m_bdev;
 				bio->bi_iter.bi_sector = (sector_t)cur <<
 					LOG_SECTORS_PER_BLOCK;
 				bio->bi_private = bi_private;
