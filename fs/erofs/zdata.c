@@ -641,6 +641,7 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 				       struct inode *inode,
 				       struct erofs_map_blocks *map)
 {
+	struct erofs_workgroup *grp;
 	struct z_erofs_pcluster *pcl;
 	struct z_erofs_collection *cl;
 	int err;
@@ -657,10 +658,8 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 		(map->m_flags & EROFS_MAP_FULL_MAPPED ?
 			Z_EROFS_PCLUSTER_FULL_LENGTH : 0);
 
-	if (map->m_flags & EROFS_MAP_ZIPPED)
-		pcl->algorithmformat = Z_EROFS_COMPRESSION_LZ4;
-	else
-		pcl->algorithmformat = Z_EROFS_COMPRESSION_SHIFTED;
+	/* 算法由映射结果给出（LZ4 / LZMA / SHIFTED），不能自己猜 */
+	pcl->algorithmformat = map->m_algorithmformat;
 
 	/* new pclusters should be claimed as type 1, primary and followed */
 	pcl->next = clt->owned_head;
@@ -676,8 +675,19 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 	mutex_init(&cl->lock);
 	mutex_trylock(&cl->lock);
 
-	err = erofs_register_workgroup(inode->i_sb, &pcl->obj);
-	if (err) {
+	grp = erofs_insert_workgroup(inode->i_sb, &pcl->obj);
+	if (IS_ERR(grp)) {
+		err = PTR_ERR(grp);
+		mutex_unlock(&cl->lock);
+		z_erofs_free_pcluster(pcl);
+		return err;
+	}
+	if (grp != &pcl->obj) {
+		/*
+		 * 别人先抢到了同一个 pcluster：记住胜出的那个，把自己这份释放掉，
+		 * 让调用方按 -EAGAIN 重试（外层就是这么处理的）。
+		 */
+		clt->pcl = container_of(grp, struct z_erofs_pcluster, obj);
 		mutex_unlock(&cl->lock);
 		z_erofs_free_pcluster(pcl);
 		return -EAGAIN;

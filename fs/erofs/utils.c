@@ -76,43 +76,48 @@ repeat:
 	return grp;
 }
 
-int erofs_register_workgroup(struct super_block *sb,
-			     struct erofs_workgroup *grp)
+struct erofs_workgroup *erofs_insert_workgroup(struct super_block *sb,
+							       struct erofs_workgroup *grp)
 {
-	struct erofs_sb_info *sbi;
+	struct erofs_sb_info *const sbi = EROFS_SB(sb);
+	struct erofs_workgroup *pre;
 	int err;
 
-	/* grp shouldn't be broken or used before */
-	if (atomic_read(&grp->refcount) != 1) {
-		DBG_BUGON(1);
-		return -EINVAL;
-	}
-
-	err = radix_tree_preload(GFP_NOFS);
-	if (err)
-		return err;
-
-	sbi = EROFS_SB(sb);
-	spin_lock(&sbi->tree_lock);
-
 	/*
-	 * Bump up reference count before making this workgroup
-	 * visible to other users in order to avoid potential UAF
-	 * without serialized by workstn_lock.
+	 * 先抬高引用计数再让它对别人可见，避免被 tree_lock 系列化之外的 UAF。
+	 * radix tree 没有 cmpxchg，这里在锁里先查后插，语义与 5.15 的 __xa_cmpxchg
+	 * 一致：已存在就取它的引用并把自己那份放掉。
 	 */
-	__erofs_workgroup_get(grp);
+	atomic_inc(&grp->refcount);
 
-	err = radix_tree_insert(&sbi->workstn_tree, grp->index, grp);
-	if (err)
-		/*
-		 * it's safe to decrease since the workgroup isn't visible
-		 * and refcount >= 2 (cannot be freezed).
-		 */
-		__erofs_workgroup_put(grp);
-
+repeat:
+	err = radix_tree_preload(GFP_NOFS);
+	if (err) {
+		atomic_dec(&grp->refcount);
+		return ERR_PTR(err);
+	}
+	spin_lock(&sbi->tree_lock);
+	pre = radix_tree_lookup(&sbi->workstn_tree, grp->index);
+	if (!pre) {
+		err = radix_tree_insert(&sbi->workstn_tree, grp->index, grp);
+		spin_unlock(&sbi->tree_lock);
+		radix_tree_preload_end();
+		if (err) {
+			atomic_dec(&grp->refcount);
+			return ERR_PTR(err);
+		}
+		return grp;
+	}
 	spin_unlock(&sbi->tree_lock);
 	radix_tree_preload_end();
-	return err;
+
+	if (erofs_workgroup_get(pre)) {
+		/* 试图把已在树里的那个正当化 */
+		cond_resched();
+		goto repeat;
+	}
+	atomic_dec(&grp->refcount);
+	return pre;
 }
 
 static void  __erofs_workgroup_free(struct erofs_workgroup *grp)
