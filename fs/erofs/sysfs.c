@@ -62,6 +62,7 @@ static struct attribute *erofs_attrs[] = {
 EROFS_ATTR_FEATURE(zero_padding);
 EROFS_ATTR_FEATURE(compr_cfgs);
 EROFS_ATTR_FEATURE(big_pcluster);
+EROFS_ATTR_FEATURE(chunked_file);
 EROFS_ATTR_FEATURE(compr_head2);
 EROFS_ATTR_FEATURE(sb_chksum);
 
@@ -69,6 +70,7 @@ static struct attribute *erofs_feat_attrs[] = {
 	ATTR_LIST(zero_padding),
 	ATTR_LIST(compr_cfgs),
 	ATTR_LIST(big_pcluster),
+	ATTR_LIST(chunked_file),
 	ATTR_LIST(compr_head2),
 	ATTR_LIST(sb_chksum),
 	NULL,

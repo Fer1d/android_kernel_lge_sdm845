@@ -63,6 +63,8 @@ struct erofs_sb_lz4_info {
 };
 
 struct erofs_sb_info {
+	struct erofs_dev_context *devs;
+	u16 device_id_mask;	/* valid bits of device id to be used */
 	/* sysfs support */
 	struct kobject s_kobj;
 	struct completion s_kobj_unregister;
@@ -264,6 +266,10 @@ struct erofs_inode {
 
 	union {
 		erofs_blk_t raw_blkaddr;
+		struct {
+			unsigned short	chunkformat;
+			unsigned char	chunkbits;
+		};
 #ifdef CONFIG_EROFS_FS_ZIP
 		struct {
 			unsigned short z_advise;
@@ -503,6 +509,33 @@ static inline void erofs_pagepool_add(struct page **pagepool,
 	*pagepool = page;
 }
 void erofs_release_pages(struct page **pagepool);
+
+
+struct erofs_device_info {
+	char *path;
+	struct block_device *bdev;
+
+	u32 blocks;
+	u32 mapped_blkaddr;
+};
+
+/* 多设备上下文：取自 ACK 5.15，idr 按 device id 索引 */
+struct erofs_dev_context {
+	struct idr tree;
+	struct rw_semaphore rwsem;
+
+	unsigned int extra_devices;
+};
+
+struct erofs_map_dev {
+	struct block_device *m_bdev;
+
+	erofs_off_t m_pa;
+	unsigned int m_deviceid;
+};
+
+/* data.c */
+int erofs_map_dev(struct super_block *sb, struct erofs_map_dev *dev);
 
 /* sysfs.c */
 int erofs_register_sysfs(struct super_block *sb);

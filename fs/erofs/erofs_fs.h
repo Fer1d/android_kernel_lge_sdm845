@@ -24,15 +24,16 @@
 #define EROFS_FEATURE_INCOMPAT_DEVICE_TABLE	0x00000008
 #define EROFS_FEATURE_INCOMPAT_COMPR_HEAD2	0x00000008
 /*
- * 本内核已实现的特性集合。chunk 文件与多设备（CHUNKED_FILE/DEVICE_TABLE）
- * 的盘上处理还没移植，就先不接受带这两位的镜像 —— 否则会出现「挂载成功但读不出
- * 数据」这种最难查的故障。等那一批代码落地后再一起加进来。
+ * 本内核已实现的特性集合。多设备（DEVICE_TABLE）还没做完：设备选择逻辑未接上，
+ * 先不接受带这一位的镜像 —— 否则 chunk 索引里的 device_id 会被忽略，出现「挂载
+ * 成功但读出错数据」这种最难查的故障。等那段代码落地后再打开。
  */
 #define EROFS_ALL_FEATURE_INCOMPAT		\
 	(EROFS_FEATURE_INCOMPAT_LZ4_0PADDING | \
 	 EROFS_FEATURE_INCOMPAT_COMPR_CFGS | \
 	 EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER | \
-	 EROFS_FEATURE_INCOMPAT_COMPR_HEAD2)
+	 EROFS_FEATURE_INCOMPAT_COMPR_HEAD2 | \
+	 EROFS_FEATURE_INCOMPAT_CHUNKED_FILE)
 
 #define EROFS_SB_EXTSLOT_SIZE	16
 

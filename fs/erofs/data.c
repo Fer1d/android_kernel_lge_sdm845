@@ -43,6 +43,9 @@ struct page *erofs_get_meta_page(struct super_block *sb, erofs_blk_t blkaddr)
 	return page;
 }
 
+static int erofs_map_blocks(struct inode *inode,
+			    struct erofs_map_blocks *map, int flags);
+
 static int erofs_map_blocks_flatmode(struct inode *inode,
 				     struct erofs_map_blocks *map,
 				     int flags)
@@ -142,7 +145,7 @@ submit_bio_retry:
 		erofs_blk_t blknr;
 		unsigned int blkoff;
 
-		err = erofs_map_blocks_flatmode(inode, &map, EROFS_GET_BLOCKS_RAW);
+		err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW);
 		if (err)
 			goto err_out;
 
@@ -306,6 +309,79 @@ static int erofs_raw_access_readpages(struct file *filp,
 	return 0;
 }
 
+static int erofs_map_blocks(struct inode *inode,
+			    struct erofs_map_blocks *map, int flags)
+{
+	struct super_block *sb = inode->i_sb;
+	struct erofs_inode *vi = EROFS_I(inode);
+	struct erofs_inode_chunk_index *idx;
+	struct page *page;
+	u64 chunknr;
+	unsigned int unit;
+	erofs_off_t pos;
+	int err = 0;
+
+	map->m_deviceid = 0;
+	if (map->m_la >= inode->i_size) {
+		/* leave out-of-bound access unmapped */
+		map->m_flags = 0;
+		map->m_plen = 0;
+		goto out;
+	}
+
+	if (vi->datalayout != EROFS_INODE_CHUNK_BASED)
+		return erofs_map_blocks_flatmode(inode, map, flags);
+
+	if (vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
+		unit = sizeof(*idx);			/* chunk index */
+	else
+		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;	/* block map */
+
+	chunknr = map->m_la >> vi->chunkbits;
+	pos = ALIGN(iloc(EROFS_SB(sb), vi->nid) + vi->inode_isize +
+		    vi->xattr_isize, unit) + unit * chunknr;
+
+	page = erofs_get_meta_page(inode->i_sb, erofs_blknr(pos));
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+
+	map->m_la = chunknr << vi->chunkbits;
+	map->m_plen = min_t(erofs_off_t, 1UL << vi->chunkbits,
+			    roundup(inode->i_size - map->m_la, EROFS_BLKSIZ));
+
+	/* handle block map */
+	if (!(vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES)) {
+		__le32 *blkaddr = page_address(page) + erofs_blkoff(pos);
+
+		if (le32_to_cpu(*blkaddr) == EROFS_NULL_ADDR) {
+			map->m_flags = 0;
+		} else {
+			map->m_pa = blknr_to_addr(le32_to_cpu(*blkaddr));
+			map->m_flags = EROFS_MAP_MAPPED;
+		}
+		goto out_unlock;
+	}
+	/* parse chunk indexes */
+	idx = page_address(page) + erofs_blkoff(pos);
+	switch (le32_to_cpu(idx->blkaddr)) {
+	case EROFS_NULL_ADDR:
+		map->m_flags = 0;
+		break;
+	default:
+		map->m_deviceid = le16_to_cpu(idx->device_id) &
+			EROFS_SB(sb)->device_id_mask;
+		map->m_pa = blknr_to_addr(le32_to_cpu(idx->blkaddr));
+		map->m_flags = EROFS_MAP_MAPPED;
+		break;
+	}
+out_unlock:
+	unlock_page(page);
+	put_page(page);
+out:
+	map->m_llen = map->m_plen;
+	return err;
+}
+
 static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
 {
 	struct inode *inode = mapping->host;
@@ -320,7 +396,7 @@ static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
 			return 0;
 	}
 
-	if (!erofs_map_blocks_flatmode(inode, &map, EROFS_GET_BLOCKS_RAW))
+	if (!erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW))
 		return erofs_blknr(map.m_pa);
 
 	return 0;
