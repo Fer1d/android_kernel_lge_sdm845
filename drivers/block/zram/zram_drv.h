@@ -41,6 +41,9 @@
  */
 #define ZRAM_FLAG_SHIFT 24
 
+/* Only 2 bits are allowed for comp priority index */
+#define ZRAM_COMP_PRIORITY_MASK	0x3
+
 /* Flags for zram pages (table[page_no].flags) */
 enum zram_pageflags {
 	/* zram slot is locked */
@@ -49,10 +52,24 @@ enum zram_pageflags {
 	ZRAM_WB,	/* page is stored on backing_device */
 	ZRAM_UNDER_WB,	/* page is under writeback */
 	ZRAM_HUGE,	/* Incompressible page */
+	ZRAM_COMPRESS_LOW,	/* below the compression target */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
+	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
+
+	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
+	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
+
+/*
+ * The upper bits of table[index].flags count how many idle-marking
+ * generations a page has survived.
+ */
+#define ZRAM_IDLE_COUNT_SHIFT	__NR_ZRAM_PAGEFLAGS
+#define ZRAM_IDLE_COUNT_MAX	10
+#define ZRAM_IDLE_COUNT_BITS	4
+#define ZRAM_IDLE_COUNT_MASK	(((1UL << ZRAM_IDLE_COUNT_BITS) - 1) << 				 ZRAM_IDLE_COUNT_SHIFT)
 
 /*-- Data structures */
 
@@ -78,7 +95,9 @@ struct zram_stats {
 	atomic64_t notify_free;	/* no. of swap slot free notifications */
 	atomic64_t same_pages;		/* no. of same element filled pages */
 	atomic64_t huge_pages;		/* no. of huge pages */
+	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
 	atomic64_t pages_stored;	/* no. of pages currently stored */
+	atomic64_t lowratio_pages;	/* pages below the compression target */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 	atomic64_t writestall;		/* no. of write slow paths */
 	atomic64_t miss_free;		/* no. of missed free */
@@ -89,10 +108,20 @@ struct zram_stats {
 #endif
 };
 
+#ifdef CONFIG_ZRAM_MULTI_COMP
+#define ZRAM_PRIMARY_COMP	0U
+#define ZRAM_SECONDARY_COMP	1U
+#define ZRAM_MAX_COMPS	4U
+#else
+#define ZRAM_PRIMARY_COMP	0U
+#define ZRAM_SECONDARY_COMP	0U
+#define ZRAM_MAX_COMPS	1U
+#endif
+
 struct zram {
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
-	struct zcomp *comp;
+	struct zcomp *comps[ZRAM_MAX_COMPS];
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
@@ -107,18 +136,18 @@ struct zram {
 	 * we can store in a disk.
 	 */
 	u64 disksize;	/* bytes */
-	char compressor[CRYPTO_MAX_ALG_NAME];
+	const char *comp_algs[ZRAM_MAX_COMPS];
+	s8 num_active_comps;
 	/*
 	 * zram is claimed so open request will be failed
 	 */
-	bool claim; /* Protected by bdev->bd_mutex */
-	struct file *backing_dev;
+	bool claim; /* Protected by disk->open_mutex */
 #ifdef CONFIG_ZRAM_WRITEBACK
+	struct file *backing_dev;
 	spinlock_t wb_limit_lock;
 	bool wb_limit_enable;
 	u64 bd_wb_limit;
 	struct block_device *bdev;
-	unsigned int old_block_size;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
 #endif
@@ -126,4 +155,22 @@ struct zram {
 	struct dentry *debugfs_dir;
 #endif
 };
+
+static inline unsigned int zram_idle_count(struct zram *zram, u32 index)
+{
+	return zram->table[index].flags >> ZRAM_IDLE_COUNT_SHIFT;
+}
+
+static inline void zram_clear_idle_count(struct zram *zram, u32 index)
+{
+	zram->table[index].flags &= ~ZRAM_IDLE_COUNT_MASK;
+}
+
+static inline void zram_inc_idle_count(struct zram *zram, u32 index)
+{
+	unsigned int count = zram_idle_count(zram, index);
+
+	if (count < ZRAM_IDLE_COUNT_MAX)
+		zram->table[index].flags += BIT(ZRAM_IDLE_COUNT_SHIFT);
+}
 #endif

@@ -1,0 +1,59 @@
+#
+# initialize and configure zram/swap including some tweaks related.
+#
+service zramswapon /vendor/bin/init.lge.zramswap.sh start
+	user root
+	group system
+	disabled
+	oneshot
+
+#
+# deinit the zram/swap
+#
+service zramswapoff /vendor/bin/init.lge.zramswap.sh stop
+	user root
+	group system
+	disabled
+	oneshot
+
+#
+# The below is not only the project "Svelte", but also LGE's feature-added svelte.
+#
+#on property:ro.boot.ksm=1
+# Configure and enable KSM
+#	write /sys/kernel/mm/ksm/pages_to_scan 100
+#	write /sys/kernel/mm/ksm/sleep_millisecs 500
+#	write /sys/kernel/mm/ksm/run 1
+
+#on property:sys.boot_completed=1
+on boot
+# initialize zram/swap
+	start zramswapon
+
+#
+# zram recompression is userspace driven: the driver only runs a pass when
+# "recompress" is written, so init has to poke the script. This is the one-shot
+# form, handy over adb:  setprop ctl.start zram-recompress
+#
+service zram-recompress /vendor/bin/init.lge.zramswap.sh recompress
+	user root
+	group system
+	disabled
+	oneshot
+
+#
+# The same script sleeping between passes. Repeating a pass is cheap, because
+# the kernel flags a page no secondary algorithm could shrink as INCOMPRESSIBLE
+# and never tries it again, so each pass only pays for the pages written since
+# the previous one. persist.zram.recomp_interval=0 turns it off, and the first
+# pass is delayed by persist.zram.recomp_delay (default 300s) so it never races
+# the boot itself.
+#
+service zram-recompress-loop /vendor/bin/init.lge.zramswap.sh recompress-loop
+	user root
+	group system
+	class late_start
+	disabled
+
+on property:sys.boot_completed=1
+	start zram-recompress-loop

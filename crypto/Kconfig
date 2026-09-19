@@ -40,6 +40,16 @@ config CRYPTO_ALGAPI
 config CRYPTO_ALGAPI2
 	tristate
 
+config CRYPTO_ACOMP2
+	tristate
+	select CRYPTO_ALGAPI2
+	select SGL_ALLOC
+
+config CRYPTO_ACOMP
+	tristate
+	select CRYPTO_ALGAPI
+	select CRYPTO_ACOMP2
+
 config CRYPTO_AEAD
 	tristate
 	select CRYPTO_AEAD2
@@ -1637,6 +1647,29 @@ config CRYPTO_LZ4
 	help
 	  This is the LZ4 algorithm.
 
+config CRYPTO_LZ4K
+	tristate "LZ4K compression algorithm"
+	select CRYPTO_ALGAPI
+	select LZ4K_COMPRESS
+	select LZ4K_DECOMPRESS
+	help
+	  This is the LZ4K algorithm.
+
+config CRYPTO_LZ4K_OPLUS
+	tristate "Lz4k_oplus compression algorithm"
+	select CRYPTO_ALGAPI
+	select CRYPTO_ACOMP2
+	help
+	  This is the lz4k_oplus algorithm.
+
+config CRYPTO_LZ4KD
+	tristate "LZ4KD compression algorithm"
+	select CRYPTO_ALGAPI
+	select LZ4KD_COMPRESS
+	select LZ4KD_DECOMPRESS
+	help
+	  This is the LZ4KD algorithm.
+
 config CRYPTO_LZ4HC
 	tristate "LZ4HC compression algorithm"
 	select CRYPTO_ALGAPI
@@ -1653,6 +1686,13 @@ config CRYPTO_ZSTD
 	select ZSTD_DECOMPRESS
 	help
 	  This is the zstd algorithm.
+
+config CRYPTO_ZSTDN
+	tristate "Zstdn compression algorithm"
+	select CRYPTO_ALGAPI
+	select CRYPTO_ACOMP2
+	help
+	  This is the zstdn algorithm.
 
 comment "Random Number Generation"
 

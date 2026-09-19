@@ -23,6 +23,10 @@ config HAVE_ARCH_BITREVERSE
 config RATIONAL
 	bool
 
+config SGL_ALLOC
+	bool
+	default n
+
 config GENERIC_STRNCPY_FROM_USER
 	bool
 
@@ -235,10 +239,22 @@ config LZO_DECOMPRESS
 config LZ4_COMPRESS
 	tristate
 
+config LZ4K_COMPRESS
+	tristate
+
 config LZ4HC_COMPRESS
 	tristate
 
 config LZ4_DECOMPRESS
+	tristate
+
+config LZ4K_DECOMPRESS
+	tristate
+
+config LZ4KD_COMPRESS
+	tristate
+
+config LZ4KD_DECOMPRESS
 	tristate
 
 config ZSTD_COMPRESS
