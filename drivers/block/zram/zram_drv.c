@@ -2351,7 +2351,8 @@ static ssize_t disksize_store(struct device *dev,
 	int err;
 
 #ifdef CONFIG_ZRAM_HARDCODE_DISKSIZE
-	disksize = (u64)CONFIG_ZRAM_DISKSIZE * SZ_1M;
+	/* 内核级 ZRAM 1:1：容量取物理内存大小，写 sysfs 的值仍被忽略 */
+	disksize = (u64)totalram_pages << PAGE_SHIFT;
 #else
     disksize = memparse(buf, NULL);
 #endif	
