@@ -99,25 +99,14 @@ config ZRAM_MEMORY_TRACKING
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
 
 config ZRAM_HARDCODE_DISKSIZE
-       bool "Hardcode Zram Disksize"
-       depends on ZRAM
-       default n
-       help
-	 It can force the zram size to be set. 
-	 If it is disabled, the zram disksize will be calculated by. And if you want to set it, say Y and set ZRAM_DISKSIZE to XXXX (MB).
-	 If unsure, just say N.
-	 
-if ZRAM_HARDCODE_DISKSIZE
-
-config ZRAM_DISKSIZE
-      int "Zram Disksize"
-	  range 1 4096
-	  default 2048
+	bool "Force zram disksize to physical RAM size (ZRAM 1:1)"
+	depends on ZRAM
+	default n
 	help
-	It can force the zram size to be set. 
-	It should be set to XXXX (MB).
-	
-endif
+	 When enabled, writes to /sys/block/zram0/disksize are ignored and the
+	 zram capacity is set to the amount of physical RAM (ZRAM 1:1).
+	 When disabled, the disksize is whatever userspace writes.
+	 If unsure, just say N.
 
 config ZRAM_MULTI_COMP
 	bool "Enable multiple compression algorithms"
