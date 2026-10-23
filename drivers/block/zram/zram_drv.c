@@ -500,7 +500,7 @@ static ssize_t backing_dev_store(struct device *dev,
 	if (sz > 0 && file_name[sz - 1] == '\n')
 		file_name[sz - 1] = 0x00;
 
-	backing_dev = filp_open_block(file_name, O_RDWR|O_LARGEFILE, 0);
+	backing_dev = filp_open(file_name, O_RDWR|O_LARGEFILE, 0);
 	if (IS_ERR(backing_dev)) {
 		err = PTR_ERR(backing_dev);
 		backing_dev = NULL;
@@ -604,7 +604,7 @@ static void free_block_bdev(struct zram *zram, unsigned long blk_idx)
 
 static void zram_page_end_io(struct bio *bio)
 {
-	struct page *page = bio_first_page_all(bio);
+	struct page *page = bio->bi_io_vec[0].bv_page;
 
 	page_endio(page, op_is_write(bio_op(bio)),
 			bio->bi_error);
@@ -624,8 +624,9 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 		return -ENOMEM;
 
 	bio->bi_iter.bi_sector = entry * (PAGE_SIZE >> 9);
-	bio_set_dev(bio, zram->bdev);
-	if (!bio_add_page(bio, bvec->bv_page, bvec->bv_len, bvec->bv_offset)) {
+	bio->bi_bdev = zram->bdev;
+	if (bio_add_page(bio, bvec->bv_page, bvec->bv_len,
+			 bvec->bv_offset) != bvec->bv_len) {
 		bio_put(bio);
 		return -EIO;
 	}
@@ -749,18 +750,24 @@ static ssize_t writeback_store(struct device *dev,
 			continue;
 		}
 
-		bio_init(&bio, &bio_vec, 1);
-		bio_set_dev(&bio, zram->bdev);
+		bio_init(&bio);
+		bio.bi_io_vec = &bio_vec;
+		bio.bi_max_vecs = 1;
+		bio.bi_bdev = zram->bdev;
 		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
 		bio.bi_opf = REQ_OP_WRITE | REQ_SYNC;
 
-		bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
-				bvec.bv_offset);
-		/*
-		 * XXX: A single page IO would be inefficient for write
-		 * but it would be not bad as starter.
-		 */
-		err = submit_bio_wait(&bio);
+		err = -EIO;
+		if (bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
+				bvec.bv_offset) == bvec.bv_len) {
+			/*
+			 * XXX: A single page IO would be inefficient for write
+			 * but it would be not bad as starter.
+			 */
+			err = submit_bio_wait(&bio);
+		}
+		/* Release associations without freeing the stack-allocated bio. */
+		bio_reset(&bio);
 		if (err) {
 			zram_slot_lock(zram, index);
 			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
