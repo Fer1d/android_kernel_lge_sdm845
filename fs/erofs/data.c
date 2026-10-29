@@ -43,6 +43,9 @@ struct page *erofs_get_meta_page(struct super_block *sb, erofs_blk_t blkaddr)
 	return page;
 }
 
+static int erofs_map_blocks(struct inode *inode,
+			    struct erofs_map_blocks *map, int flags);
+
 static int erofs_map_blocks_flatmode(struct inode *inode,
 				     struct erofs_map_blocks *map,
 				     int flags)
@@ -130,6 +133,32 @@ static inline struct bio *erofs_read_raw_page(struct bio *bio,
 	if (bio &&
 	    /* not continuous */
 	    *last_block + 1 != current_block) {
+
+	/*
+	 * 多设备（DEVICE_TABLE）下，逻辑上连续的两个 chunk 可能落在不同设备，
+	 * 复用已建好的 bio 之前必须确认设备一致。单设备镜像 extra_devices 为 0，
+	 * 这里零开销。
+	 */
+	if (bio && EROFS_SB(sb)->devs && EROFS_SB(sb)->devs->extra_devices) {
+		struct erofs_map_blocks tmap = {
+			.m_la = blknr_to_addr(current_block),
+		};
+		struct erofs_map_dev tmdev;
+
+		err = erofs_map_blocks(inode, &tmap, EROFS_GET_BLOCKS_RAW);
+		if (!err) {
+			tmdev.m_deviceid = tmap.m_deviceid;
+			tmdev.m_pa = tmap.m_pa;
+			err = erofs_map_dev(sb, &tmdev);
+		}
+		if (err)
+			goto err_out;
+		if ((tmap.m_flags & EROFS_MAP_MAPPED) &&
+		    bio->bi_bdev != tmdev.m_bdev) {
+			submit_bio(bio);
+			bio = NULL;
+		}
+	}
 submit_bio_retry:
 		submit_bio(bio);
 		bio = NULL;
@@ -141,8 +170,18 @@ submit_bio_retry:
 		};
 		erofs_blk_t blknr;
 		unsigned int blkoff;
+		struct erofs_map_dev mdev;
 
-		err = erofs_map_blocks_flatmode(inode, &map, EROFS_GET_BLOCKS_RAW);
+		err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW);
+		if (err)
+			goto err_out;
+
+		mdev.m_deviceid = map.m_deviceid;
+		mdev.m_pa = map.m_pa;
+		err = erofs_map_dev(sb, &mdev);
+		if (err)
+			goto err_out;
+		map.m_pa = mdev.m_pa;
 		if (err)
 			goto err_out;
 
@@ -204,7 +243,7 @@ submit_bio_retry:
 		bio = bio_alloc(GFP_NOIO, nblocks);
 
 		bio->bi_end_io = erofs_readendio;
-		bio->bi_bdev = sb->s_bdev;
+		bio->bi_bdev = mdev.m_bdev;
 		bio->bi_iter.bi_sector = (sector_t)blknr <<
 			LOG_SECTORS_PER_BLOCK;
 		bio->bi_opf = REQ_OP_READ | (ra ? REQ_RAHEAD : 0);
@@ -306,6 +345,119 @@ static int erofs_raw_access_readpages(struct file *filp,
 	return 0;
 }
 
+static int erofs_map_blocks(struct inode *inode,
+			    struct erofs_map_blocks *map, int flags)
+{
+	struct super_block *sb = inode->i_sb;
+	struct erofs_inode *vi = EROFS_I(inode);
+	struct erofs_inode_chunk_index *idx;
+	struct page *page;
+	u64 chunknr;
+	unsigned int unit;
+	erofs_off_t pos;
+	int err = 0;
+
+	map->m_deviceid = 0;
+	if (map->m_la >= inode->i_size) {
+		/* leave out-of-bound access unmapped */
+		map->m_flags = 0;
+		map->m_plen = 0;
+		goto out;
+	}
+
+	if (vi->datalayout != EROFS_INODE_CHUNK_BASED)
+		return erofs_map_blocks_flatmode(inode, map, flags);
+
+	if (vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
+		unit = sizeof(*idx);			/* chunk index */
+	else
+		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;	/* block map */
+
+	chunknr = map->m_la >> vi->chunkbits;
+	pos = ALIGN(iloc(EROFS_SB(sb), vi->nid) + vi->inode_isize +
+		    vi->xattr_isize, unit) + unit * chunknr;
+
+	page = erofs_get_meta_page(inode->i_sb, erofs_blknr(pos));
+	if (IS_ERR(page))
+		return PTR_ERR(page);
+
+	map->m_la = chunknr << vi->chunkbits;
+	map->m_plen = min_t(erofs_off_t, 1UL << vi->chunkbits,
+			    roundup(inode->i_size - map->m_la, EROFS_BLKSIZ));
+
+	/* handle block map */
+	if (!(vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES)) {
+		__le32 *blkaddr = page_address(page) + erofs_blkoff(pos);
+
+		if (le32_to_cpu(*blkaddr) == EROFS_NULL_ADDR) {
+			map->m_flags = 0;
+		} else {
+			map->m_pa = blknr_to_addr(le32_to_cpu(*blkaddr));
+			map->m_flags = EROFS_MAP_MAPPED;
+		}
+		goto out_unlock;
+	}
+	/* parse chunk indexes */
+	idx = page_address(page) + erofs_blkoff(pos);
+	switch (le32_to_cpu(idx->blkaddr)) {
+	case EROFS_NULL_ADDR:
+		map->m_flags = 0;
+		break;
+	default:
+		map->m_deviceid = le16_to_cpu(idx->device_id) &
+			EROFS_SB(sb)->device_id_mask;
+		map->m_pa = blknr_to_addr(le32_to_cpu(idx->blkaddr));
+		map->m_flags = EROFS_MAP_MAPPED;
+		break;
+	}
+out_unlock:
+	unlock_page(page);
+	put_page(page);
+out:
+	map->m_llen = map->m_plen;
+	return err;
+}
+
+int erofs_map_dev(struct super_block *sb, struct erofs_map_dev *map)
+{
+	struct erofs_dev_context *devs = EROFS_SB(sb)->devs;
+	struct erofs_device_info *dif;
+	int id;
+
+	/* primary device by default */
+	map->m_bdev = sb->s_bdev;
+
+	if (map->m_deviceid) {
+		down_read(&devs->rwsem);
+		dif = idr_find(&devs->tree, map->m_deviceid - 1);
+		if (!dif) {
+			up_read(&devs->rwsem);
+			return -ENODEV;
+		}
+		map->m_bdev = dif->bdev;
+		up_read(&devs->rwsem);
+	} else if (devs->extra_devices) {
+		down_read(&devs->rwsem);
+		idr_for_each_entry(&devs->tree, dif, id) {
+			erofs_off_t startoff, length;
+
+			if (!dif->mapped_blkaddr)
+				continue;
+			startoff = blknr_to_addr(dif->mapped_blkaddr);
+			length = blknr_to_addr(dif->blocks);
+
+			if (map->m_pa >= startoff &&
+			    map->m_pa < startoff + length) {
+				map->m_pa -= startoff;
+				map->m_bdev = dif->bdev;
+						break;
+			}
+		}
+		up_read(&devs->rwsem);
+	}
+	return 0;
+}
+
 static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
 {
 	struct inode *inode = mapping->host;
@@ -320,7 +472,7 @@ static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
 			return 0;
 	}
 
-	if (!erofs_map_blocks_flatmode(inode, &map, EROFS_GET_BLOCKS_RAW))
+	if (!erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_RAW))
 		return erofs_blknr(map.m_pa);
 
 	return 0;

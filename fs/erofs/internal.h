@@ -15,7 +15,16 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/kobject.h>
+#include <linux/completion.h>
 #include "erofs_fs.h"
+#include <linux/fs_types.h>
+
+/* 5.15 把这两个运行期的伪算法编号放在 internal.h（旧版在 compress.h） */
+enum {
+	Z_EROFS_COMPRESSION_SHIFTED = Z_EROFS_COMPRESSION_MAX,
+	Z_EROFS_COMPRESSION_RUNTIME_MAX
+};
 
 /* redefine pr_fmt "erofs: " */
 #undef pr_fmt
@@ -54,6 +63,17 @@ struct erofs_sb_lz4_info {
 };
 
 struct erofs_sb_info {
+	struct erofs_dev_context *devs;
+	u16 device_id_mask;	/* valid bits of device id to be used */
+	u64 total_blocks;
+	u32 primarydevice_blocks;
+	/* 4.9 的挂载项解析在 read_superblock 之后，设备表这两个字段先存下来 */
+	u16 devt_slotoff;
+	u16 ondisk_extra_devices;
+	/* sysfs support */
+	struct kobject s_kobj;
+	struct completion s_kobj_unregister;
+
 #ifdef CONFIG_EROFS_FS_ZIP
 	/* list for all registered superblocks, mainly for shrinker */
 	struct list_head list;
@@ -226,6 +246,9 @@ static inline bool erofs_sb_has_##name(struct erofs_sb_info *sbi) \
 EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_LZ4_0PADDING)
 EROFS_FEATURE_FUNCS(compr_cfgs, incompat, INCOMPAT_COMPR_CFGS)
 EROFS_FEATURE_FUNCS(big_pcluster, incompat, INCOMPAT_BIG_PCLUSTER)
+EROFS_FEATURE_FUNCS(chunked_file, incompat, INCOMPAT_CHUNKED_FILE)
+EROFS_FEATURE_FUNCS(device_table, incompat, INCOMPAT_DEVICE_TABLE)
+EROFS_FEATURE_FUNCS(compr_head2, incompat, INCOMPAT_COMPR_HEAD2)
 EROFS_FEATURE_FUNCS(sb_chksum, compat, COMPAT_SB_CHKSUM)
 
 /* atomic flag definitions */
@@ -251,6 +274,10 @@ struct erofs_inode {
 
 	union {
 		erofs_blk_t raw_blkaddr;
+		struct {
+			unsigned short	chunkformat;
+			unsigned char	chunkbits;
+		};
 #ifdef CONFIG_EROFS_FS_ZIP
 		struct {
 			unsigned short z_advise;
@@ -323,7 +350,7 @@ extern const struct address_space_operations z_erofs_aops;
  * of the corresponding uncompressed data in the file.
  */
 enum {
-	BH_Zipped = BH_PrivateStart,
+	BH_Encoded = BH_PrivateStart,
 	BH_FullMapped,
 };
 
@@ -332,7 +359,8 @@ enum {
 /* Located in metadata (could be copied from bd_inode) */
 #define EROFS_MAP_META		(1 << BH_Meta)
 /* The extent has been compressed */
-#define EROFS_MAP_ZIPPED	(1 << BH_Zipped)
+#define EROFS_MAP_ENCODED	(1 << BH_Encoded)
+#define EROFS_MAP_ZIPPED	(1 << BH_Encoded)
 /* The length of extent is full */
 #define EROFS_MAP_FULL_MAPPED	(1 << BH_FullMapped)
 
@@ -340,6 +368,8 @@ struct erofs_map_blocks {
 	erofs_off_t m_pa, m_la;
 	u64 m_plen, m_llen;
 
+	unsigned short m_deviceid;
+	char m_algorithmformat;
 	unsigned int m_flags;
 
 	struct page *mpage;
@@ -347,6 +377,10 @@ struct erofs_map_blocks {
 
 /* Flags used by erofs_map_blocks_flatmode() */
 #define EROFS_GET_BLOCKS_RAW    0x0001
+/* 取精确解压长度（fiemap 用；本树未移植 fiemap，标志保留但不使用） */
+#define EROFS_GET_BLOCKS_FIEMAP	0x0002
+/* 请求长度不可忽略时映射整个 extent（LZMA 需要） */
+#define EROFS_GET_BLOCKS_READMORE	0x0004
 
 /* zmap.c */
 #ifdef CONFIG_EROFS_FS_ZIP
@@ -417,14 +451,13 @@ void erofs_pcpubuf_init(void);
 void erofs_pcpubuf_exit(void);
 
 /* utils.c / zdata.c */
-struct page *erofs_allocpage(struct list_head *pool, gfp_t gfp);
 
 #ifdef CONFIG_EROFS_FS_ZIP
 int erofs_workgroup_put(struct erofs_workgroup *grp);
 struct erofs_workgroup *erofs_find_workgroup(struct super_block *sb,
 					     pgoff_t index);
-int erofs_register_workgroup(struct super_block *sb,
-			     struct erofs_workgroup *grp);
+struct erofs_workgroup *erofs_insert_workgroup(struct super_block *sb,
+					       struct erofs_workgroup *grp);
 void erofs_workgroup_free_rcu(struct erofs_workgroup *grp);
 void erofs_shrinker_register(struct super_block *sb);
 void erofs_shrinker_unregister(struct super_block *sb);
@@ -436,6 +469,14 @@ int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
 				       struct erofs_workgroup *egrp);
 int erofs_try_to_free_cached_page(struct address_space *mapping,
 				  struct page *page);
+#ifdef CONFIG_EROFS_FS_ZIP_LZMA
+int z_erofs_lzma_init(void);
+void z_erofs_lzma_exit(void);
+
+int z_erofs_load_lzma_config(struct super_block *sb,
+			    struct erofs_super_block *dsb,
+			    struct z_erofs_lzma_cfgs *lzma, int len);
+#endif
 int z_erofs_load_lz4_config(struct super_block *sb,
 			    struct erofs_super_block *dsb,
 			    struct z_erofs_lz4_cfgs *lz4, int len);
@@ -458,10 +499,59 @@ static inline int z_erofs_load_lz4_config(struct super_block *sb,
 }
 #endif	/* !CONFIG_EROFS_FS_ZIP */
 
+/* 取自 5.15 include/linux/range.h 的区间判断语义：val - start < len */
+#ifndef in_range32
+#define in_range32(val, start, len)\
+	((u32)((val) - (start)) < (u32)(len))
+#endif
+
 #define EFSCORRUPTED    EUCLEAN         /* Filesystem is corrupted */
 
 #ifndef lru_to_page
 #define lru_to_page(head) (list_entry((head)->prev, struct page, lru))
 #endif
+
+/* utils.c / zdata.c */
+struct page *erofs_allocpage(struct page **pagepool, gfp_t gfp);
+static inline void erofs_pagepool_add(struct page **pagepool,
+		struct page *page)
+{
+	set_page_private(page, (unsigned long)*pagepool);
+	*pagepool = page;
+}
+void erofs_release_pages(struct page **pagepool);
+
+
+struct erofs_device_info {
+	char *path;
+	struct block_device *bdev;
+
+	u32 blocks;
+	u32 mapped_blkaddr;
+};
+
+/* 多设备上下文：取自 ACK 5.15，idr 按 device id 索引 */
+struct erofs_dev_context {
+	struct idr tree;
+	struct rw_semaphore rwsem;
+
+	unsigned int extra_devices;
+};
+
+struct erofs_map_dev {
+	struct block_device *m_bdev;
+
+	erofs_off_t m_pa;
+	unsigned int m_deviceid;
+};
+
+/* data.c */
+int erofs_map_dev(struct super_block *sb, struct erofs_map_dev *dev);
+
+/* sysfs.c */
+int erofs_register_sysfs(struct super_block *sb);
+void erofs_unregister_sysfs(struct super_block *sb);
+int __init erofs_init_sysfs(void);
+void erofs_exit_sysfs(void);
 
 #endif	/* __EROFS_INTERNAL_H */
