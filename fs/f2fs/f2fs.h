@@ -102,6 +102,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define F2FS_MOUNT_RESERVE_ROOT		0x01000000
 #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
 #define F2FS_MOUNT_ATGC			0x08000000
+#define F2FS_MOUNT_GC_MERGE		0x10000000
 
 #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
 #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
@@ -1125,6 +1126,13 @@ struct atgc_management {
 	unsigned long long age_threshold;	/* age threshold */
 };
 
+struct f2fs_gc_control {
+	unsigned int victim_segno;	/* target victim segment number */
+	int init_gc_type;		/* FG_GC or BG_GC */
+	bool no_bg_gc;			/* check the space and stop bg_gc */
+	bool err_gc_skipped;		/* return EAGAIN if GC skipped */
+};
+
 /* For s_flag in struct f2fs_sb_info */
 enum {
 	SBI_IS_DIRTY,				/* dirty flag for checkpoint */
@@ -1160,6 +1168,8 @@ enum {
 	GC_IDLE_AT,
 	GC_URGENT_HIGH,
 	GC_URGENT_LOW,
+	GC_URGENT_MID,
+	MAX_GC_MODE,
 };
 
 enum {
@@ -1301,7 +1311,18 @@ struct f2fs_sb_info {
 	struct atgc_management am;
 	struct f2fs_gc_kthread	*gc_thread;	/* GC thread */
 	unsigned int cur_victim_sec;		/* current victim section num */
-	unsigned int gc_mode;			/* current GC state */
+	unsigned int gc_mode;			/* effective GC state */
+	unsigned int user_gc_mode;		/* requested mode, without rapid GC */
+	spinlock_t gc_mode_lock;			/* modes, rapid GC and HIGH budget */
+	bool gc_urgent_high_limited;
+	unsigned int gc_urgent_high_remaining;
+	struct mutex gc_thread_lock;		/* GC thread lifetime */
+	wait_queue_head_t fggc_wq;		/* survives GC thread teardown */
+	unsigned int gc_request_seq;
+	unsigned int gc_done_seq;
+	bool gc_in_writeback;			/* do not merge writeback callbacks */
+	unsigned int gc_segment_mode;
+	unsigned int gc_reclaimed_segs[MAX_GC_MODE];
 	unsigned int next_victim_seg[2];	/* next segment in victim section */
 	unsigned int rapid_gc;			/* is rapid GC running */
 	/* for skip statistic */
@@ -2270,6 +2291,13 @@ static inline bool is_idle(struct f2fs_sb_info *sbi, int type)
 	if (SM_I(sbi) && SM_I(sbi)->fcc_info &&
 			atomic_read(&SM_I(sbi)->fcc_info->queued_flush))
 		return false;
+
+	if (sbi->gc_mode == GC_URGENT_MID)
+		return true;
+
+	if (sbi->gc_mode == GC_URGENT_LOW &&
+			(type == DISCARD_TIME || type == GC_TIME))
+		return true;
 
 	return f2fs_time_over(sbi, type);
 }
@@ -3269,8 +3297,9 @@ void __init f2fs_init_rapid_gc(void);
 void __exit f2fs_destroy_rapid_gc(void);
 
 block_t f2fs_start_bidx_of_node(unsigned int node_ofs, struct inode *inode);
-int f2fs_gc(struct f2fs_sb_info *sbi, bool sync, bool background,
-			unsigned int segno);
+int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control);
+bool f2fs_gc_merge(struct f2fs_sb_info *sbi);
+void f2fs_set_gc_mode(struct f2fs_sb_info *sbi, unsigned int mode);
 void f2fs_build_gc_manager(struct f2fs_sb_info *sbi);
 int f2fs_resize_fs(struct f2fs_sb_info *sbi, __u64 block_count);
 int __init f2fs_create_garbage_collection_cache(void);

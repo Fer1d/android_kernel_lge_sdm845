@@ -28,6 +28,17 @@ enum {
 	FAULT_INFO_TYPE,	/* struct f2fs_fault_info */
 #endif
 	RESERVED_BLOCKS,	/* struct f2fs_sb_info */
+	GC_THREAD,	/* struct f2fs_gc_kthread */
+};
+
+static const char *gc_mode_names[MAX_GC_MODE] = {
+	"GC_NORMAL",
+	"GC_IDLE_CB",
+	"GC_IDLE_GREEDY",
+	"GC_IDLE_AT",
+	"GC_URGENT_HIGH",
+	"GC_URGENT_LOW",
+	"GC_URGENT_MID"
 };
 
 struct f2fs_attr {
@@ -50,6 +61,8 @@ static unsigned char *__struct_ptr(struct f2fs_sb_info *sbi, int struct_type)
 		return (unsigned char *)NM_I(sbi);
 	else if (struct_type == F2FS_SBI || struct_type == RESERVED_BLOCKS)
 		return (unsigned char *)sbi;
+	else if (struct_type == GC_THREAD)
+		return (unsigned char *)sbi->gc_thread;
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 	else if (struct_type == FAULT_INFO_RATE ||
 					struct_type == FAULT_INFO_TYPE)
@@ -172,6 +185,17 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 		return len;
 	}
 
+	if (!strcmp(a->attr.name, "gc_urgent") ||
+			!strcmp(a->attr.name, "gc_idle"))
+		return snprintf(buf, PAGE_SIZE, "%s\n",
+				gc_mode_names[READ_ONCE(sbi->user_gc_mode)]);
+	if (!strcmp(a->attr.name, "gc_segment_mode"))
+		return snprintf(buf, PAGE_SIZE, "%s\n",
+				gc_mode_names[READ_ONCE(sbi->gc_segment_mode)]);
+	if (!strcmp(a->attr.name, "gc_reclaimed_segments"))
+		return snprintf(buf, PAGE_SIZE, "%u\n",
+			READ_ONCE(sbi->gc_reclaimed_segs[READ_ONCE(sbi->gc_segment_mode)]));
+
 	ui = (unsigned int *)(ptr + a->offset);
 
 	return snprintf(buf, PAGE_SIZE, "%u\n", *ui);
@@ -268,18 +292,10 @@ out:
 		return -EINVAL;
 
 	if (!strcmp(a->attr.name, "gc_idle")) {
-		if (t == GC_IDLE_CB) {
-			sbi->gc_mode = GC_IDLE_CB;
-		} else if (t == GC_IDLE_GREEDY) {
-			sbi->gc_mode = GC_IDLE_GREEDY;
-		} else if (t == GC_IDLE_AT) {
-			if (!sbi->am.atgc_enabled)
-				return -EINVAL;
-			sbi->gc_mode = GC_IDLE_AT;
-		} else {
-			sbi->gc_mode = GC_NORMAL;
-		}
-		return count;
+		if (t > GC_IDLE_AT || (t == GC_IDLE_AT && !sbi->am.atgc_enabled))
+			return -EINVAL;
+		f2fs_set_gc_mode(sbi, t);
+		goto wake_gc;
 	}
 
 
@@ -290,6 +306,51 @@ out:
 		return count;
 	}
 
+	if (!strcmp(a->attr.name, "gc_urgent")) {
+		unsigned int mode;
+
+		if (t > 3)
+			return -EINVAL;
+		mode = t == 1 ? GC_URGENT_HIGH : t == 2 ? GC_URGENT_LOW :
+			t == 3 ? GC_URGENT_MID : GC_NORMAL;
+		f2fs_set_gc_mode(sbi, mode);
+wake_gc:
+		if (sbi->gc_thread) {
+			sbi->gc_thread->gc_wake = 1;
+			wake_up_interruptible_all(&sbi->gc_thread->gc_wait_queue_head);
+		}
+		wake_up_discard_thread(sbi, true);
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "gc_segment_mode")) {
+		if (t < MAX_GC_MODE)
+			WRITE_ONCE(sbi->gc_segment_mode, t);
+		else
+			return -EINVAL;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "gc_reclaimed_segments")) {
+		if (t != 0)
+			return -EINVAL;
+		WRITE_ONCE(sbi->gc_reclaimed_segs[READ_ONCE(sbi->gc_segment_mode)], 0);
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "gc_urgent_high_remaining")) {
+		if (t > UINT_MAX)
+			return -EINVAL;
+		spin_lock(&sbi->gc_mode_lock);
+		sbi->gc_urgent_high_limited = t == 0 ? false : true;
+		sbi->gc_urgent_high_remaining = t;
+		spin_unlock(&sbi->gc_mode_lock);
+
+		return count;
+	}
+
+	if (a->struct_type == GC_THREAD && (!t || t > UINT_MAX))
+		return -EINVAL;
 	*ui = (unsigned int)t;
 
 	return count;
@@ -299,7 +360,24 @@ static ssize_t f2fs_sbi_store(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi,
 			const char *buf, size_t count)
 {
-	return __sbi_store(a, sbi, buf, count);
+	ssize_t ret;
+	bool gc_entry = (!strcmp(a->attr.name, "gc_urgent") ||
+				!strcmp(a->attr.name, "gc_idle") ||
+					a->struct_type == GC_THREAD);
+
+	if (gc_entry) {
+		if (!down_read_trylock(&sbi->sb->s_umount))
+			return -EAGAIN;
+	}
+	if (gc_entry)
+		mutex_lock(&sbi->gc_thread_lock);
+	ret = __sbi_store(a, sbi, buf, count);
+	if (gc_entry)
+		mutex_unlock(&sbi->gc_thread_lock);
+	if (gc_entry)
+		up_read(&sbi->sb->s_umount);
+
+	return ret;
 }
 
 static ssize_t f2fs_attr_show(struct kobject *kobj,
@@ -309,6 +387,17 @@ static ssize_t f2fs_attr_show(struct kobject *kobj,
 								s_kobj);
 	struct f2fs_attr *a = container_of(attr, struct f2fs_attr, attr);
 
+	if (a->struct_type == GC_THREAD) {
+		ssize_t ret;
+
+		if (!down_read_trylock(&sbi->sb->s_umount))
+			return -EAGAIN;
+		mutex_lock(&sbi->gc_thread_lock);
+		ret = a->show ? a->show(a, sbi, buf) : 0;
+		mutex_unlock(&sbi->gc_thread_lock);
+		up_read(&sbi->sb->s_umount);
+		return ret;
+	}
 	return a->show ? a->show(a, sbi, buf) : 0;
 }
 
@@ -420,7 +509,14 @@ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info,
 		umount_discard_timeout, interval_time[UMOUNT_DISCARD_TIMEOUT]);
 F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, iostat_enable, iostat_enable);
 F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, readdir_ra, readdir_ra);
+F2FS_RW_ATTR(GC_THREAD, f2fs_gc_kthread, gc_urgent_sleep_time,
+							urgent_sleep_time);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_urgent, gc_mode);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_idle, user_gc_mode);
 F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_pin_file_thresh, gc_pin_file_threshold);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_segment_mode, gc_segment_mode);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_reclaimed_segments, gc_reclaimed_segs);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_urgent_high_remaining, gc_urgent_high_remaining);
 F2FS_RW_ATTR(F2FS_SBI, f2fs_super_block, extension_list, extension_list);
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 F2FS_RW_ATTR(FAULT_INFO_RATE, f2fs_fault_info, inject_rate, inject_rate);
@@ -472,7 +568,13 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(umount_discard_timeout),
 	ATTR_LIST(iostat_enable),
 	ATTR_LIST(readdir_ra),
+	ATTR_LIST(gc_urgent_sleep_time),
+	ATTR_LIST(gc_urgent),
+	ATTR_LIST(gc_idle),
 	ATTR_LIST(gc_pin_file_thresh),
+	ATTR_LIST(gc_segment_mode),
+	ATTR_LIST(gc_reclaimed_segments),
+	ATTR_LIST(gc_urgent_high_remaining),
 	ATTR_LIST(extension_list),
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 	ATTR_LIST(inject_rate),

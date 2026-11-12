@@ -23,7 +23,11 @@ What:		/sys/fs/f2fs/<disk>/gc_idle
 Date:		July 2013
 Contact:	"Namjae Jeon" <namjae.jeon@samsung.com>
 Description:
-		 Controls the victim selection policy for garbage collection.
+		 Select the requested GC mode: 0 normal, 1 idle cost-benefit,
+		 2 idle greedy, 3 idle age-threshold (requires atgc mount option).
+		 Reads return the requested GC_* mode name, shared with gc_urgent.
+		 The last write to either node wins; 0 restores normal. Rapid GC
+		 temporarily uses HIGH without changing the requested mode.
 
 What:		/sys/fs/f2fs/<disk>/reclaim_segments
 Date:		October 2013
@@ -219,13 +223,50 @@ What:		/sys/fs/f2fs/<disk>/gc_urgent
 Date:		August 2017
 Contact:	"Jaegeuk Kim" <jaegeuk@kernel.org>
 Description:
-		 Do background GC agressively
+		 Write 0 for normal, 1 urgent HIGH, 2 urgent LOW, 3 urgent MID.
+		 Other values are rejected. Reads return the requested GC_* mode
+		 name (also for modes selected through gc_idle), not the temporary
+		 rapid-GC override. LOW bypasses idle time for GC/discard only;
+		 MID bypasses idle time and runs periodically without HIGH's
+		 greedy victim selection or forced SSR. Outstanding I/O is still
+		 checked by is_idle for LOW/MID. HIGH bypasses the GC idle gate.
+		 Rapid GC temporarily selects HIGH, then restores the user mode.
 
 What:		/sys/fs/f2fs/<disk>/gc_urgent_sleep_time
 Date:		August 2017
 Contact:	"Jaegeuk Kim" <jaegeuk@kernel.org>
 Description:
-		 Controls sleep time of GC urgent mode
+		 Controls HIGH/MID GC sleep time in milliseconds (default 500).
+		 Values must be in 1..UINT_MAX. Rapid GC keeps its 1 ms interval.
+		 Requires a running GC thread; absent thread returns EINVAL.
+
+What:		/sys/fs/f2fs/<disk>/gc_urgent_high_remaining
+Date:		November 2026
+Contact:	linux-f2fs-devel@lists.sourceforge.net
+Description:
+		 Set the remaining user HIGH trial count; 0 disables the limit
+		 (default). Each user HIGH background round consumes one trial.
+		 Rapid GC, merged foreground work and other modes consume none.
+		 Once exhausted, the next HIGH round restores normal. Writes are
+		 serialized with mode changes; a positive budget is at most UINT_MAX.
+
+What:		/sys/fs/f2fs/<disk>/gc_segment_mode
+Date:		November 2026
+Contact:	linux-f2fs-devel@lists.sourceforge.net
+Description:
+		 Select the gc_reclaimed_segments counter: 0 normal, 1 idle CB,
+		 2 idle greedy, 3 idle AT, 4 urgent HIGH, 5 urgent LOW, 6 urgent MID.
+		 Reads return the corresponding GC_* mode name; default is normal.
+
+What:		/sys/fs/f2fs/<disk>/gc_reclaimed_segments
+Date:		November 2026
+Contact:	linux-f2fs-devel@lists.sourceforge.net
+Description:
+		 Per-effective-mode unsigned segment-processing counter, matching
+		 GC segment statistics (not necessarily a fully freed section).
+		 Rapid GC is charged to HIGH. Write 0 to reset the selected counter;
+		 other writes are rejected. Counters are best-effort statistics and
+		 may race reset/read with GC or wrap at UINT_MAX.
 
 What:		/sys/fs/f2fs/<disk>/readdir_ra
 Date:		November 2017
