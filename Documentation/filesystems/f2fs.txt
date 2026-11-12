@@ -119,6 +119,10 @@ nogc_merge             Disable GC merge feature (default).
                        gc_urgent_high_remaining limits only user HIGH rounds;
                        gc_segment_mode selects gc_reclaimed_segments statistics.
                        ATGC remains opt-in and is disabled by default.
+atgc                   Enable age-threshold garbage collection after three days
+                       of accumulated mounted time. This option is disabled by
+                       default and cannot be changed through remount. It does
+                       not change the on-disk checkpoint format.
 disable_roll_forward   Disable the roll-forward recovery routine
 norecovery             Disable the roll-forward recovery routine, mounted read-
                        only (i.e., -o ro,disable_roll_forward)
