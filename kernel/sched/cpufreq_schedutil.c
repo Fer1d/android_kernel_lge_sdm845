@@ -138,14 +138,14 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 }
 
 static void sugov_update_commit(struct sugov_policy *sg_policy, u64 time,
-				unsigned int next_freq)
+				unsigned int next_freq, bool force)
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 
 	if (sg_policy->next_freq == next_freq)
 		return;
 
-	if (sugov_up_down_rate_limit(sg_policy, time, next_freq)) {
+	if (!force && sugov_up_down_rate_limit(sg_policy, time, next_freq)) {
 		/* Don't cache a raw freq that didn't become next_freq */
 		sg_policy->cached_raw_freq = 0;
 		return;
@@ -216,6 +216,53 @@ static void sugov_get_util(unsigned long *util, unsigned long *max, int cpu)
 	*max = cfs_max;
 
 	*util = boosted_cpu_util(cpu, &loadcpu->walt_load);
+}
+
+/* Keep the legacy WALT/SchedTune path bit-for-bit for neutral clamps. */
+static bool sugov_uclamp_active(int cpu)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	struct rq *rq = cpu_rq(cpu);
+
+	return uclamp_rq_get(rq, UCLAMP_MIN) ||
+	       uclamp_rq_get(rq, UCLAMP_MAX) != SCHED_CAPACITY_SCALE;
+#else
+	return false;
+#endif
+}
+
+static unsigned long sugov_uclamp_util(int cpu, unsigned long util)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	return uclamp_rq_util_with(cpu_rq(cpu), util, NULL);
+#else
+	return util;
+#endif
+}
+
+static bool sugov_uclamp_max_active(int cpu)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	return uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX) <
+	       SCHED_CAPACITY_SCALE;
+#else
+	return false;
+#endif
+}
+
+/*
+ * IOWAIT stores a frequency ratio, unlike WALT's capacity-scaled signals.
+ * Restore capacity units before HISPEED/NL/PL and utilization clamping.
+ */
+static void sugov_util_to_capacity(int cpu, unsigned long *util,
+				   unsigned long *max)
+{
+	unsigned long capacity = arch_scale_cpu_capacity(NULL, cpu);
+
+	if (*max != capacity) {
+		*util = mult_frac(*util, capacity, *max);
+		*max = capacity;
+	}
 }
 
 static void sugov_set_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
@@ -352,21 +399,24 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	unsigned long util, max, hs_util;
 	unsigned int next_f;
 	bool busy;
+	bool force = flags & SCHED_CPUFREQ_UCLAMP;
 
 	flags &= ~SCHED_CPUFREQ_RT_DL;
 
-	if (!sg_policy->tunables->pl && flags & SCHED_CPUFREQ_PL)
+	if (!force && !sg_policy->tunables->pl && flags & SCHED_CPUFREQ_PL)
 		return;
 
 	sugov_set_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
 
-	if (!sugov_should_update_freq(sg_policy, time))
+	if (!force && !sugov_should_update_freq(sg_policy, time))
 		return;
 
 	busy = sugov_cpu_is_busy(sg_cpu);
 
 	raw_spin_lock(&sg_policy->update_lock);
+	if (force)
+		sg_policy->cached_raw_freq = UINT_MAX;
 	if (flags & SCHED_CPUFREQ_RT_DL) {
 		/* clear cache when it's bypassed */
 		sg_policy->cached_raw_freq = 0;
@@ -391,20 +441,25 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 					max, sg_cpu->walt_load.nl,
 					sg_cpu->walt_load.pl, flags);
 		sugov_iowait_boost(sg_cpu, &util, &max);
+		if (sugov_uclamp_active(sg_cpu->cpu))
+			sugov_util_to_capacity(sg_cpu->cpu, &util, &max);
 		sugov_walt_adjust(sg_cpu, &util, &max);
+		if (sugov_uclamp_active(sg_cpu->cpu))
+			util = sugov_uclamp_util(sg_cpu->cpu, util);
 		next_f = get_next_freq(sg_policy, util, max);
 		/*
 		 * Do not reduce the frequency if the CPU has not been idle
 		 * recently, as the reduction is likely to be premature then.
 		 */
-		if (busy && next_f < sg_policy->next_freq) {
+		if (!force && busy && next_f < sg_policy->next_freq &&
+		    !sugov_uclamp_max_active(sg_cpu->cpu)) {
 			next_f = sg_policy->next_freq;
 			/* clear cache when it's bypassed */
 			sg_policy->cached_raw_freq = 0;
 		}
 	}
 
-	sugov_update_commit(sg_policy, time, next_f);
+	sugov_update_commit(sg_policy, time, next_f, force);
 	raw_spin_unlock(&sg_policy->update_lock);
 }
 
@@ -414,6 +469,15 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned long util = 0, max = 1;
 	unsigned int j;
+	bool clamped = false;
+
+	/* A policy shares frequency, not its most restrictive CPU's MAX. */
+	for_each_cpu(j, policy->cpus) {
+		if (sugov_uclamp_active(j)) {
+			clamped = true;
+			break;
+		}
+	}
 
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
@@ -440,6 +504,20 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 
 		j_util = j_sg_cpu->util;
 		j_max = j_sg_cpu->max;
+		if (clamped) {
+			/* Boost and clamp only this CPU's own demand. */
+			sugov_iowait_boost(j_sg_cpu, &j_util, &j_max);
+			sugov_util_to_capacity(j, &j_util, &j_max);
+			sugov_walt_adjust(j_sg_cpu, &j_util, &j_max);
+			if (sugov_uclamp_active(j))
+				j_util = sugov_uclamp_util(j, j_util);
+			if (j_util * max >= j_max * util) {
+				util = j_util;
+				max = j_max;
+			}
+			continue;
+		}
+
 		if (j_util * max >= j_max * util) {
 			util = j_util;
 			max = j_max;
@@ -459,8 +537,9 @@ static void sugov_update_shared(struct update_util_data *hook, u64 time,
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long util, max, hs_util;
 	unsigned int next_f;
+	bool force = flags & SCHED_CPUFREQ_UCLAMP;
 
-	if (!sg_policy->tunables->pl && flags & SCHED_CPUFREQ_PL)
+	if (!force && !sg_policy->tunables->pl && flags & SCHED_CPUFREQ_PL)
 		return;
 
 	sugov_get_util(&util, &max, sg_cpu->cpu);
@@ -491,7 +570,9 @@ static void sugov_update_shared(struct update_util_data *hook, u64 time,
 				max, sg_cpu->walt_load.nl,
 				sg_cpu->walt_load.pl, flags);
 
-	if (sugov_should_update_freq(sg_policy, time)) {
+	if (force || sugov_should_update_freq(sg_policy, time)) {
+		if (force)
+			sg_policy->cached_raw_freq = UINT_MAX;
 		if (flags & SCHED_CPUFREQ_RT_DL) {
 			/* clear cache when it's bypassed */
 			sg_policy->cached_raw_freq = 0;
@@ -500,7 +581,7 @@ static void sugov_update_shared(struct update_util_data *hook, u64 time,
 			next_f = sugov_next_freq_shared(sg_cpu, time);
 		}
 
-		sugov_update_commit(sg_policy, time, next_f);
+		sugov_update_commit(sg_policy, time, next_f, force);
 	}
 
 	raw_spin_unlock(&sg_policy->update_lock);

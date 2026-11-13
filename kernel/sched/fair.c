@@ -5726,6 +5726,46 @@ struct energy_env {
 
 static int cpu_util_wake(int cpu, struct task_struct *p);
 
+static bool task_uclamp_active(struct task_struct *p)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	return uclamp_eff_value(p, UCLAMP_MIN) ||
+	       uclamp_eff_value(p, UCLAMP_MAX) != SCHED_CAPACITY_SCALE;
+#else
+	return false;
+#endif
+}
+
+/* Performance demand only: never feed this back into load accounting. */
+static unsigned long task_uclamp_util(struct task_struct *p,
+				     unsigned long util)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	unsigned long min_util = uclamp_eff_value(p, UCLAMP_MIN);
+	unsigned long max_util = uclamp_eff_value(p, UCLAMP_MAX);
+
+	if (max_util != SCHED_CAPACITY_SCALE)
+		util = min(util, max_util);
+	return max(util, min_util);
+#else
+	return util;
+#endif
+}
+
+static unsigned long cpu_uclamp_util(int cpu, unsigned long util,
+				    struct task_struct *p)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	struct rq *rq = cpu_rq(cpu);
+
+	if (uclamp_rq_get(rq, UCLAMP_MIN) ||
+	    uclamp_rq_get(rq, UCLAMP_MAX) != SCHED_CAPACITY_SCALE ||
+	    (p && task_uclamp_active(p)))
+		return uclamp_rq_util_with(rq, util, p);
+#endif
+	return util;
+}
+
 /*
  * __cpu_norm_util() returns the cpu util relative to a specific capacity,
  * i.e. it's busy ratio, in the range [0..SCHED_LOAD_SCALE], which is useful for
@@ -5766,6 +5806,15 @@ static unsigned long group_max_util(struct energy_env *eenv, int cpu_idx)
 		if (unlikely(cpu == eenv->cpu[cpu_idx].cpu_id))
 			util += eenv->util_delta;
 
+		/* Select an OPP from performance demand, not busy time. */
+#ifdef CONFIG_UCLAMP_TASK
+		if (cpu != eenv->cpu[cpu_idx].cpu_id &&
+		    cpu == task_cpu(eenv->p) && task_on_rq_queued(eenv->p))
+			util = uclamp_rq_util_without(cpu_rq(cpu), util, eenv->p);
+		else
+#endif
+			util = cpu_uclamp_util(cpu, util,
+				cpu == eenv->cpu[cpu_idx].cpu_id ? eenv->p : NULL);
 		max_util = max(max_util, util);
 
 		/*
@@ -6413,7 +6462,7 @@ boosted_task_util(struct task_struct *p)
 
 	trace_sched_boost_task(p, util, margin);
 
-	return util + margin;
+	return task_uclamp_util(p, util + margin);
 }
 
 static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
@@ -7113,6 +7162,7 @@ retry:
 			unsigned long capacity_curr = capacity_curr_of(i);
 			unsigned long capacity_orig = capacity_orig_of(i);
 			unsigned long wake_util, new_util, min_capped_util;
+			unsigned long raw_util;
 
 			cpumask_clear_cpu(i, &search_cpus);
 
@@ -7134,10 +7184,12 @@ retry:
 			 * accounting. However, the blocked utilization may be zero.
 			 */
 			wake_util = cpu_util_wake(i, p);
-			new_util = wake_util + task_util(p);
+			raw_util = wake_util + task_util(p);
+			new_util = raw_util;
 			spare_cap = capacity_orig_of(i) - wake_util;
 
-			if (spare_cap > most_spare_cap) {
+			if (spare_cap > most_spare_cap &&
+			    (!task_uclamp_active(p) || task_fits_max(p, i))) {
 				most_spare_cap = spare_cap;
 				most_spare_cap_cpu = i;
 			}
@@ -7148,6 +7200,7 @@ retry:
 			 * than the one required to boost the task.
 			 */
 			new_util = max(min_util, new_util);
+			new_util = cpu_uclamp_util(i, new_util, p);
 
 			/*
 			 * Include minimum capacity constraint:
@@ -7158,7 +7211,8 @@ retry:
 			 */
 			min_capped_util = max(new_util, capacity_min_of(i));
 
-			if (cpu_check_overutil_condition(i, new_util))
+			/* MAX is a performance hint, not removal of runnable work. */
+			if (cpu_check_overutil_condition(i, max(raw_util, new_util)))
 				continue;
 
 			/*
@@ -7479,7 +7533,8 @@ static int wake_cap(struct task_struct *p, int cpu, int prev_cpu)
 	/* Bring task utilization in sync with prev_cpu */
 	sync_entity_load_avg(&p->se);
 
-	return min_cap * 1024 < task_util(p) * capacity_margin;
+	return min_cap * 1024 <
+		task_uclamp_util(p, task_util(p)) * capacity_margin;
 }
 
 static inline int wake_to_idle(struct task_struct *p)
@@ -7620,7 +7675,8 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 		}
 	}
 
-	if (bias_to_prev_cpu(p, rtg_target)) {
+	if (bias_to_prev_cpu(p, rtg_target) &&
+	    (!task_uclamp_active(p) || task_fits_max(p, prev_cpu))) {
 		target_cpu = prev_cpu;
 		fastpath = PREV_CPU_BIAS;
 		goto out;
@@ -7685,7 +7741,8 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 			delta = task_util(p);
 #endif
 		/* Not enough spare capacity on previous cpu */
-		if (__cpu_overutilized(prev_cpu, delta)) {
+		if (__cpu_overutilized(prev_cpu, delta) ||
+		    (task_uclamp_active(p) && !task_fits_max(p, prev_cpu))) {
 			schedstat_inc(p->se.statistics.nr_wakeups_secb_insuff_cap);
 			schedstat_inc(this_rq()->eas_stats.secb_insuff_cap);
 			target_cpu = next_cpu;
