@@ -358,11 +358,23 @@ a single snapshot of the current setting. Failed or skipped recompression keeps
 the old classification. Disabling the setting therefore does not immediately
 remove old low flags or exclude those old objects from explicit writeback.
 
-Writeback still uses synchronous single-page I/O, not a 32-page batch. The
-per-request max_pages does not replace the existing device writeback budget.
-Errors may be returned after earlier pages were written; completed writeback is
-not rolled back. A slot freed, rewritten or accessed during I/O is not replaced
-by that writeback's saved contents.
+Writeback gathers at most 32 pages in request-private buffers, using a
+synchronous BIO only for consecutive backing-device page slots. A backing-slot
+hole, a full batch, the per-request success bound or the end of the scan flushes
+the batch. Memory pressure may reduce the batch size; failure to allocate even
+one buffer returns ENOMEM. Page buffers need not be physically contiguous.
+Requests on the same device are serialized. Reads retain the existing backing
+read path. A slot freed, rewritten, accessed or explicitly marked new during
+collection or I/O is not replaced by that writeback's saved contents.
+
+The per-request max_pages counts successful installations, not physical I/O
+attempts, and pending pages are included when enforcing that bound. It does not
+replace the device writeback budget described below. A failed BIO (including a
+partially completed BIO) installs none of its pages. An error or pending signal
+cancels unsubmitted pages and releases temporary backing slots; earlier completed
+batches are not rolled back. Signals observed after synchronous I/O also prevent
+installation of that batch. Errors can therefore be returned after physical I/O
+or earlier successful installations.
 
 If there are lots of write IO with flash device, potentially, it has
 flash wearout problem so that admin needs to design write limitation
@@ -379,7 +391,27 @@ Once writeback_limit_enable is set, zram doesn't allow any writeback
 until admin set the budget via /sys/block/zramX/writeback_limit.
 
 (If admin doesn't enable writeback_limit_enable, writeback_limit's value
-assigned via /sys/block/zramX/writeback_limit is meaninless.)
+assigned via /sys/block/zramX/writeback_limit is meaningless.)
+
+The device budget is a physical-write-attempt budget in 4KiB units, not a count
+of successfully installed backing pages. Immediately before submitting a BIO,
+writeback reserves the whole submitted portion under wb_limit_lock. A batch is
+truncated to the remaining whole-page budget; no BIO may overshoot it. On kernels
+with pages larger than 4KiB, a remainder smaller than one page cannot be used.
+Exhaustion returns EIO after any affordable part of the pending batch completes.
+Reservations not submitted (for example, a signal or BIO construction failure)
+are refunded. Submitted pages consume budget even on I/O error, partial device
+completion, cancellation or concurrent slot invalidation: physical writes may
+already have occurred, so these are not refunded.
+
+Both writeback_limit and writeback_limit_enable stores wait interruptibly for
+any current writeback request on this device to finish. Thus a new quota or
+enable setting takes effect between requests, never midway through a reservation
+or refund. Reading the remaining budget may show a current reservation. There
+is no old-request refund into a newly configured quota. bd_stat's third column
+counts submitted physical pages (including failed attempts), while its first
+column counts successfully installed pages still on the backing device. Both
+are reported in the existing 4KiB units.
 
 If admin want to limit writeback as per-day 400M, he could do it
 like below.

@@ -16,6 +16,7 @@
 #define _ZRAM_DRV_H_
 
 #include <linux/rwsem.h>
+#include <linux/mutex.h>
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 
@@ -145,6 +146,8 @@ struct zram {
 	bool claim; /* Protected by disk->open_mutex */
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
+	/* Lock order: init_lock -> wb_mutex -> slot lock / wb_limit_lock. */
+	struct mutex wb_mutex;
 	spinlock_t wb_limit_lock;
 	bool wb_limit_enable;
 	u64 bd_wb_limit;
