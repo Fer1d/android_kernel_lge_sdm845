@@ -119,10 +119,31 @@ nogc_merge             Disable GC merge feature (default).
                        gc_urgent_high_remaining limits only user HIGH rounds;
                        gc_segment_mode selects gc_reclaimed_segments statistics.
                        ATGC remains opt-in and is disabled by default.
-atgc                   Enable age-threshold garbage collection after three days
-                       of accumulated mounted time. This option is disabled by
-                       default and cannot be changed through remount. It does
-                       not change the on-disk checkpoint format.
+atgc                   Request age-threshold garbage collection. At mount
+                       initialization it becomes active only if stored accumulated
+                       mounted time is at least 259200 seconds (three days).
+                       Crossing that age during a mount does not activate it;
+                       a later mount re-evaluates the gate. Disabled by default,
+                       it cannot be toggled through remount and does not change
+                       the on-disk checkpoint format.
+                       Runtime sysfs tuning uses atgc_candidate_ratio (20%,
+                       range 0..100), atgc_candidate_count (10 sections, unsigned
+                       32-bit), atgc_age_weight (60%, range 0..100), and
+                       atgc_age_threshold (259200 seconds, unsigned 64-bit).
+                       Zero is valid for all four. The candidate search budget
+                       is max(count, ratio * victim_count / 100); percentage
+                       multiplication is widened to 64 bits to avoid overflow.
+                       Writes are serialized with victim selection and affect
+                       subsequent selections, not the mount activation gate.
+                       The local read-only atgc_enabled reports actual state.
+                       Names/semantics follow android13-5.15 commit
+                       3f0fd7f6624d7b99bd8d93cbcfe0241bc92d6448, except the local
+                       three-day default is retained instead of seven days,
+                       with explicit 64-bit threshold I/O and checked ranges.
+                       See Documentation/ABI/testing/sysfs-fs-f2fs for details.
+                       User paths migrate from /sys/fs/f2fs_dev to /sys/fs/f2fs
+                       and /proc/fs/f2fs_dev to /proc/fs/f2fs; no aliases remain.
+                       Device structures and on-disk names are unchanged.
 disable_roll_forward   Disable the roll-forward recovery routine
 norecovery             Disable the roll-forward recovery routine, mounted read-
                        only (i.e., -o ro,disable_roll_forward)

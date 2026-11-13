@@ -29,6 +29,58 @@ Description:
 		 The last write to either node wins; 0 restores normal. Rapid GC
 		 temporarily uses HIGH without changing the requested mode.
 
+What:		/sys/fs/f2fs/<disk>/atgc_candidate_ratio
+Date:		November 2026
+Contact:	F2FS maintainers
+Description:
+		 Read/write candidate percentage, range 0..100, default 20.
+		 The four writable ATGC names follow android13-5.15 commit
+		 3f0fd7f6624d7b99bd8d93cbcfe0241bc92d6448. Parameter writes
+		 are serialized with victim selection and apply to subsequent
+		 selections; they neither enable ATGC nor change the mount option.
+
+What:		/sys/fs/f2fs/<disk>/atgc_candidate_count
+Date:		November 2026
+Contact:	F2FS maintainers
+Description:
+		 Read/write candidate count, range 0..4294967295, default 10
+		 sections. As in the reference implementation, the search budget
+		 is max(count, ratio * victim_count / 100), not a hard cap of 10.
+		 Zero is accepted; traversal remains bounded by available victims.
+		 Percentage multiplication uses 64-bit arithmetic to avoid overflow.
+
+What:		/sys/fs/f2fs/<disk>/atgc_age_weight
+Date:		November 2026
+Contact:	F2FS maintainers
+Description:
+		 Read/write age weight, range 0..100, default 60 percent.
+		 Valid-block weight is 100 minus this value.
+
+What:		/sys/fs/f2fs/<disk>/atgc_age_threshold
+Date:		November 2026
+Contact:	F2FS maintainers
+Description:
+		 Read/write unsigned 64-bit age threshold in seconds, range
+		 0..18446744073709551615, default 259200 (three days), deliberately
+		 retained locally instead of the reference's 604800 (seven days).
+		 Values outside the range are rejected, never truncated to 32 bits.
+		 Candidates younger than this threshold are skipped; the existing
+		 no-victim retry with threshold zero when elapsed mounted time is
+		 below the threshold is unchanged. This is not the activation gate.
+
+What:		/sys/fs/f2fs/<disk>/atgc_enabled
+Date:		November 2026
+Contact:	F2FS maintainers
+Description:
+		 Local read-only extension, 0 or 1. Reports actual ATGC activation,
+		 not merely the presence of the atgc mount option. Activation is
+		 decided at mount initialization: atgc must be requested and stored
+		 accumulated mounted time must be at least 259200 seconds. There
+		 is no live timer activation; remount cannot toggle atgc. Runtime
+		 tuning, including age_threshold, does not change this state.
+		 All F2FS sysfs paths now use /sys/fs/f2fs, and procfs uses
+		 /proc/fs/f2fs, replacing f2fs_dev without compatibility aliases.
+
 What:		/sys/fs/f2fs/<disk>/reclaim_segments
 Date:		October 2013
 Contact:	"Jaegeuk Kim" <jaegeuk.kim@samsung.com>
