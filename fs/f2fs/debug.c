@@ -42,9 +42,9 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 	si->hit_rbtree = atomic64_read(&sbi->read_hit_rbtree);
 	si->hit_total = si->hit_largest + si->hit_cached + si->hit_rbtree;
 	si->total_ext = atomic64_read(&sbi->total_hit_ext);
-	si->ext_tree = atomic_read(&sbi->total_ext_tree);
-	si->zombie_tree = atomic_read(&sbi->total_zombie_tree);
-	si->ext_node = atomic_read(&sbi->total_ext_node);
+	si->ext_tree = atomic_read(&sbi->extent_tree[EX_READ].total_ext_tree);
+	si->zombie_tree = atomic_read(&sbi->extent_tree[EX_READ].total_zombie_tree);
+	si->ext_node = atomic_read(&sbi->extent_tree[EX_READ].total_ext_node);
 	si->ndirty_node = get_pages(sbi, F2FS_DIRTY_NODES);
 	si->ndirty_dent = get_pages(sbi, F2FS_DIRTY_DENTS);
 	si->ndirty_meta = get_pages(sbi, F2FS_DIRTY_META);
@@ -261,9 +261,9 @@ get_cache:
 	si->cache_mem += si->inmem_pages * sizeof(struct inmem_pages);
 	for (i = 0; i < MAX_INO_ENTRY; i++)
 		si->cache_mem += sbi->im[i].ino_num * sizeof(struct ino_entry);
-	si->cache_mem += atomic_read(&sbi->total_ext_tree) *
+	si->cache_mem += atomic_read(&sbi->extent_tree[EX_READ].total_ext_tree) *
 						sizeof(struct extent_tree);
-	si->cache_mem += atomic_read(&sbi->total_ext_node) *
+	si->cache_mem += atomic_read(&sbi->extent_tree[EX_READ].total_ext_node) *
 						sizeof(struct extent_node);
 
 	si->page_mem = 0;
