@@ -372,6 +372,12 @@ extern int kswapd_run(int nid);
 extern void kswapd_stop(int nid);
 
 #ifdef CONFIG_SWAP
+extern bool swap_owner_diag;
+#else
+#define swap_owner_diag false
+#endif
+
+#ifdef CONFIG_SWAP
 /* linux/mm/page_io.c */
 extern int swap_readpage(struct page *);
 extern int swap_writepage(struct page *page, struct writeback_control *wbc);

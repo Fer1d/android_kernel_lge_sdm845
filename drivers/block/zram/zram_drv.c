@@ -35,6 +35,8 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/swap.h>
+#include <linux/sched.h>
 
 #include "zram_drv.h"
 
@@ -2319,15 +2321,25 @@ static void zram_destroy_comps(struct zram *zram)
 	}
 }
 
+static void zram_owner_log(struct zram *zram, const char *op,
+		const char *phase, const char *buf, size_t len,
+		u64 actual, u64 old_size, ssize_t rc);
+
 static void zram_reset_device(struct zram *zram)
 {
 	u64 disksize;
 
 	down_write(&zram->init_lock);
+	if (swap_owner_diag)
+		zram_owner_log(zram, "internal_reset", "entry", "<internal>",
+			       10, 0, zram->disksize, 0);
 
 	zram->limit_pages = 0;
 
 	if (!init_done(zram)) {
+		if (swap_owner_diag)
+			zram_owner_log(zram, "internal_reset", "noop", "<internal>",
+				       10, 0, zram->disksize, 0);
 		up_write(&zram->init_lock);
 		return;
 	}
@@ -2337,6 +2349,8 @@ static void zram_reset_device(struct zram *zram)
 
 	set_capacity(zram->disk, 0);
 	part_stat_set_all(&zram->disk->part0, 0);
+	zram_owner_log(zram, "internal_reset", "cleared", "<internal>",
+		       10, 0, disksize, 0);
 
 	up_write(&zram->init_lock);
 	/* I/O operation under all of CPU are done so let's free */
@@ -2346,6 +2360,31 @@ static void zram_reset_device(struct zram *zram)
 	reset_bdev(zram);
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+	zram_owner_log(zram, "internal_reset", "done", "<internal>",
+		       10, 0, disksize, 0);
+}
+
+static void zram_owner_log(struct zram *zram, const char *op,
+		const char *phase, const char *buf, size_t len,
+		u64 actual, u64 old_size, ssize_t rc)
+{
+	struct task_struct *parent;
+	char comm[TASK_COMM_LEN], pcomm[TASK_COMM_LEN];
+	pid_t ppid;
+
+	if (!swap_owner_diag)
+		return;
+	get_task_comm(comm, current);
+	rcu_read_lock();
+	parent = rcu_dereference(current->real_parent);
+	ppid = task_pid_nr(parent);
+	get_task_comm(pcomm, parent);
+	rcu_read_unlock();
+	pr_info("ZRAM_OWNER_DIAG op=%s phase=%s dev=%s pid=%d tgid=%d comm=%s ppid=%d pcomm=%s actual=%llu old=%llu new=%llu totalram=%llu rc=%zd request=%.*s\n",
+		op, phase, zram->disk->disk_name, task_pid_nr(current),
+		task_tgid_nr(current), comm, ppid, pcomm, actual, old_size,
+		READ_ONCE(zram->disksize), (u64)totalram_pages << PAGE_SHIFT, rc,
+		(int)min_t(size_t, len, 64), buf);
 }
 
 static ssize_t disksize_store(struct device *dev,
@@ -2356,17 +2395,28 @@ static ssize_t disksize_store(struct device *dev,
 	struct zram *zram = dev_to_zram(dev);
 	u32 prio;
 	int err;
+	u64 old_size = 0;
 
+	if (swap_owner_diag) {
+		old_size = READ_ONCE(zram->disksize);
+		zram_owner_log(zram, "disksize", "entry", buf, len,
+			       0, old_size, 0);
+	}
 #ifdef CONFIG_ZRAM_HARDCODE_DISKSIZE
 	/* 内核级 ZRAM 1:1：容量取物理内存大小，写 sysfs 的值仍被忽略 */
 	disksize = (u64)totalram_pages << PAGE_SHIFT;
 #else
-    disksize = memparse(buf, NULL);
-#endif	
-	if (!disksize)
+	disksize = memparse(buf, NULL);
+#endif
+	if (!disksize) {
+		zram_owner_log(zram, "disksize", "exit", buf, len,
+			       disksize, old_size, -EINVAL);
 		return -EINVAL;
+	}
 
 	down_write(&zram->init_lock);
+	if (swap_owner_diag)
+		old_size = zram->disksize;
 	if (init_done(zram)) {
 		pr_info("Cannot change disksize for initialized device\n");
 		err = -EBUSY;
@@ -2398,6 +2448,8 @@ static ssize_t disksize_store(struct device *dev,
 	zram->disksize = disksize;
 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
 	revalidate_disk(zram->disk);
+	zram_owner_log(zram, "disksize", "exit", buf, len,
+		       disksize, old_size, len);
 	up_write(&zram->init_lock);
 
 	return len;
@@ -2406,6 +2458,8 @@ out_free_comps:
 	zram_destroy_comps(zram);
 	zram_meta_free(zram, disksize);
 out_unlock:
+	zram_owner_log(zram, "disksize", "exit", buf, len,
+		       disksize, old_size, err);
 	up_write(&zram->init_lock);
 	return err;
 }
@@ -2414,25 +2468,41 @@ static ssize_t reset_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
 	int ret;
-	unsigned short do_reset;
-	struct zram *zram;
+	unsigned short do_reset = 0;
+	struct zram *zram = dev_to_zram(dev);
 	struct block_device *bdev;
+	u64 old_size = 0;
 
+	if (swap_owner_diag) {
+		old_size = READ_ONCE(zram->disksize);
+		zram_owner_log(zram, "reset", "entry", buf, len,
+			       0, old_size, 0);
+	}
 	ret = kstrtou16(buf, 10, &do_reset);
-	if (ret)
+	if (ret) {
+		zram_owner_log(zram, "reset", "exit", buf, len,
+			       do_reset, old_size, ret);
 		return ret;
+	}
 
-	if (!do_reset)
+	if (!do_reset) {
+		zram_owner_log(zram, "reset", "exit", buf, len,
+			       do_reset, old_size, -EINVAL);
 		return -EINVAL;
+	}
 
-	zram = dev_to_zram(dev);
 	bdev = bdget_disk(zram->disk, 0);
-	if (!bdev)
+	if (!bdev) {
+		zram_owner_log(zram, "reset", "exit", buf, len,
+			       do_reset, old_size, -ENOMEM);
 		return -ENOMEM;
+	}
 
 	mutex_lock(&bdev->bd_mutex);
 	/* Do not reset an active device or claimed device */
 	if (bdev->bd_openers || zram->claim) {
+		zram_owner_log(zram, "reset", "exit", buf, len,
+			       do_reset, old_size, -EBUSY);
 		mutex_unlock(&bdev->bd_mutex);
 		bdput(bdev);
 		return -EBUSY;
@@ -2452,6 +2522,8 @@ static ssize_t reset_store(struct device *dev,
 	zram->claim = false;
 	mutex_unlock(&bdev->bd_mutex);
 
+	zram_owner_log(zram, "reset", "exit", buf, len,
+		       do_reset, old_size, len);
 	return len;
 }
 

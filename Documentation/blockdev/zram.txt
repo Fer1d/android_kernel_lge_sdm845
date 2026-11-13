@@ -12,6 +12,43 @@ use as swap disks, various caches under /var and maybe many more :)
 Statistics for individual zram devices are exported through sysfs nodes at
 /sys/block/zram<id>/
 
+* Temporary ownership diagnostics (disabled by default)
+
+With CONFIG_SWAP=y, the explicit kernel command-line option
+swap_owner_diag=1 enables ZRAM_OWNER_DIAG messages from boot for swapon,
+swapoff, zram disksize/reset sysfs writes, and internal device resets
+(including device removal). swap_owner_diag=0 (or omitting
+the option) leaves diagnostics disabled. Do not enable it automatically in
+build scripts, defconfigs, boot images, or normal deployments. This is a
+boot-only diagnostic option, not a zram module parameter. Modular zram uses
+the same exported switch; CONFIG_SWAP=n leaves these diagnostics disabled.
+
+Messages contain op/phase, pid/tgid/comm and real-parent ppid/pcomm copied
+under RCU, and the true return code on exit (sysfs success returns the write
+length). Entry/target rc=0 is a placeholder, not a success result. Swap paths
+are logged only after successful getname(), limited to 128 bytes; early
+failures use <unavailable>. Parent identity is a snapshot, not ancestry
+history. printk supplies timestamps; there is no additional clock sampling
+or global rate limiting, so restrict log access and enable only temporarily.
+
+Zram messages include device, request (up to 64 input bytes), actual, old,
+new and totalram (sizes in bytes). For disksize, actual is the selected size
+(page-aligned once allocation is attempted), including any
+CONFIG_ZRAM_HARDCODE_DISKSIZE override; only a successful exit means it was
+applied. For reset, actual is the parsed reset value, not a byte count.
+Internal resets use op=internal_reset, request=<internal>, actual=0 and
+phase=entry/noop/cleared/done; noop means the device was not initialized.
+cleared records old->0 under init_lock, while done means cleanup completed
+and its new value is only a later snapshot, possibly after reinitialization.
+These internal events have rc=0 because the reset routine returns void.
+Entry actual=0 is a placeholder. old/new are observations, not a new
+synchronization guarantee; concurrent requests may interleave. The request
+is bounded but not escaped, as are swap paths; embedded newlines can split
+log lines. Use exit rc to distinguish rejected EBUSY
+requests from successful changes. No reset protection or sizing policy is
+changed by this option. Collect the kernel log from boot with sufficient
+buffer capacity; no collection or boot-option activation is automatic.
+
 * Usage
 
 There are several ways to configure and manage zram device(-s):

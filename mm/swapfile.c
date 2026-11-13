@@ -35,11 +35,42 @@
 #include <linux/swapfile.h>
 #include <linux/export.h>
 #include <linux/swap_slots.h>
+#include <linux/sched.h>
 
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <linux/swapops.h>
 #include <linux/swap_cgroup.h>
+
+/* Temporary, opt-in ownership tracing; shared with modular zram. */
+bool swap_owner_diag;
+EXPORT_SYMBOL_GPL(swap_owner_diag);
+
+static int __init swap_owner_diag_setup(char *str)
+{
+	return kstrtobool(str, &swap_owner_diag) == 0;
+}
+__setup("swap_owner_diag=", swap_owner_diag_setup);
+
+static void swap_owner_log(const char *op, const char *phase,
+			   const char *path, int rc)
+{
+	struct task_struct *parent;
+	char comm[TASK_COMM_LEN], pcomm[TASK_COMM_LEN];
+	pid_t ppid;
+
+	if (!swap_owner_diag)
+		return;
+	get_task_comm(comm, current);
+	rcu_read_lock();
+	parent = rcu_dereference(current->real_parent);
+	ppid = task_pid_nr(parent);
+	get_task_comm(pcomm, parent);
+	rcu_read_unlock();
+	pr_info("ZRAM_OWNER_DIAG op=%s phase=%s pid=%d tgid=%d comm=%s ppid=%d pcomm=%s path=%.128s rc=%d\n",
+		op, phase, task_pid_nr(current), task_tgid_nr(current),
+		comm, ppid, pcomm, path ? path : "<unavailable>", rc);
+}
 
 static bool swap_count_continued(struct swap_info_struct *, pgoff_t,
 				 unsigned char);
@@ -2178,14 +2209,20 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	int err, found = 0;
 	unsigned int old_block_size;
 
-	if (!capable(CAP_SYS_ADMIN))
+	swap_owner_log("swapoff", "entry", NULL, 0);
+	if (!capable(CAP_SYS_ADMIN)) {
+		swap_owner_log("swapoff", "exit", NULL, -EPERM);
 		return -EPERM;
+	}
 
 	BUG_ON(!current->mm);
 
 	pathname = getname(specialfile);
-	if (IS_ERR(pathname))
+	if (IS_ERR(pathname)) {
+		swap_owner_log("swapoff", "exit", NULL, PTR_ERR(pathname));
 		return PTR_ERR(pathname);
+	}
+	swap_owner_log("swapoff", "target", pathname->name, 0);
 
 	victim = file_open_name(pathname, O_RDWR|O_LARGEFILE, 0);
 	err = PTR_ERR(victim);
@@ -2323,6 +2360,7 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 out_dput:
 	filp_close(victim, NULL);
 out:
+	swap_owner_log("swapoff", "exit", pathname->name, err);
 	putname(pathname);
 	return err;
 }
@@ -2751,15 +2789,22 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	struct page *page = NULL;
 	struct inode *inode = NULL;
 
-	if (swap_flags & ~SWAP_FLAGS_VALID)
+	swap_owner_log("swapon", "entry", NULL, 0);
+	if (swap_flags & ~SWAP_FLAGS_VALID) {
+		swap_owner_log("swapon", "exit", NULL, -EINVAL);
 		return -EINVAL;
+	}
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_SYS_ADMIN)) {
+		swap_owner_log("swapon", "exit", NULL, -EPERM);
 		return -EPERM;
+	}
 
 	p = alloc_swap_info();
-	if (IS_ERR(p))
+	if (IS_ERR(p)) {
+		swap_owner_log("swapon", "exit", NULL, PTR_ERR(p));
 		return PTR_ERR(p);
+	}
 
 	INIT_WORK(&p->discard_work, swap_discard_work);
 
@@ -2769,6 +2814,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		name = NULL;
 		goto bad_swap;
 	}
+	swap_owner_log("swapon", "target", name->name, 0);
 	swap_file = file_open_name(name, O_RDWR|O_LARGEFILE, 0);
 	if (IS_ERR(swap_file)) {
 		error = PTR_ERR(swap_file);
@@ -2966,6 +3012,7 @@ out:
 		kunmap(page);
 		put_page(page);
 	}
+	swap_owner_log("swapon", "exit", name ? name->name : NULL, error);
 	if (name)
 		putname(name);
 	if (inode)
