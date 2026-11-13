@@ -1845,6 +1845,16 @@ static int f2fs_read_data_page(struct file *file, struct page *page)
 	struct inode *inode = page_file_mapping(page)->host;
 	int ret = -EAGAIN;
 
+	/* Also cover readahead(2), which bypasses ->read_iter admission. */
+	if (!down_read_trylock(&F2FS_I(inode)->extm_cache)) {
+		unlock_page(page);
+		return -EBUSY;
+	}
+	if (READ_ONCE(F2FS_I(inode)->extm_state)) {
+		up_read(&F2FS_I(inode)->extm_cache);
+		unlock_page(page);
+		return -EBUSY;
+	}
 	trace_f2fs_readpage(page, DATA);
 
 	/* If the file has inline data, try to read it directly */
@@ -1853,6 +1863,7 @@ static int f2fs_read_data_page(struct file *file, struct page *page)
 	if (ret == -EAGAIN)
 		ret = f2fs_mpage_readpages(page_file_mapping(page),
 						NULL, page, 1, false);
+	up_read(&F2FS_I(inode)->extm_cache);
 	return ret;
 }
 
@@ -1863,13 +1874,18 @@ static int f2fs_read_data_pages(struct file *file,
 	struct inode *inode = mapping->host;
 	struct page *page = list_last_entry(pages, struct page, lru);
 
+	int ret;
+
 	trace_f2fs_readpages(inode, page, nr_pages);
 
-	/* If the file has inline data, skip readpages */
-	if (f2fs_has_inline_data(inode))
+	if (!down_read_trylock(&F2FS_I(inode)->extm_cache))
 		return 0;
-
-	return f2fs_mpage_readpages(mapping, pages, NULL, nr_pages, true);
+	if (READ_ONCE(F2FS_I(inode)->extm_state) || f2fs_has_inline_data(inode))
+		ret = 0;
+	else
+		ret = f2fs_mpage_readpages(mapping, pages, NULL, nr_pages, true);
+	up_read(&F2FS_I(inode)->extm_cache);
+	return ret;
 }
 
 static int encrypt_one_page(struct f2fs_io_info *fio)
@@ -3180,6 +3196,9 @@ static int f2fs_swap_activate(struct swap_info_struct *sis, struct file *file,
 {
 	struct inode *inode = file_inode(file);
 	int ret;
+
+	if (READ_ONCE(F2FS_I(inode)->extm_state))
+		return -EBUSY;
 
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;

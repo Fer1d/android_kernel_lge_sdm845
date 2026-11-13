@@ -1710,6 +1710,11 @@ next_step:
 			if (IS_ERR(inode) || is_bad_inode(inode))
 				continue;
 
+			if (READ_ONCE(F2FS_I(inode)->extm_state)) {
+				iput(inode);
+				continue;
+			}
+
 			if (is_inode_flag_set(inode, FI_PIN_FILE) &&
 							gc_type == FG_GC) {
 				f2fs_pin_file_control(inode, true);
@@ -1721,6 +1726,12 @@ next_step:
 				&F2FS_I(inode)->i_gc_rwsem[WRITE])) {
 				iput(inode);
 				sbi->skipped_gc_rwsem++;
+				continue;
+			}
+
+			if (READ_ONCE(F2FS_I(inode)->extm_state)) {
+				up_write(&F2FS_I(inode)->i_gc_rwsem[WRITE]);
+				iput(inode);
 				continue;
 			}
 
@@ -1774,6 +1785,14 @@ next_step:
 
 				/* wait for all inflight aio data */
 				inode_dio_wait(inode);
+			}
+
+			if (READ_ONCE(fi->extm_state)) {
+				if (locked) {
+					up_write(&fi->i_gc_rwsem[WRITE]);
+					up_write(&fi->i_gc_rwsem[READ]);
+				}
+				continue;
 			}
 
 			start_bidx = f2fs_start_bidx_of_node(nofs, inode)

@@ -884,6 +884,10 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	mutex_init(&fi->inmem_lock);
 	init_rwsem(&fi->i_gc_rwsem[READ]);
 	init_rwsem(&fi->i_gc_rwsem[WRITE]);
+	init_rwsem(&fi->extm_admission);
+	init_rwsem(&fi->extm_cache);
+	fi->extm_state = 0;
+	fi->extm_ever_mapped = false;
 	init_rwsem(&fi->i_mmap_sem);
 	init_rwsem(&fi->i_xattr_sem);
 
@@ -1169,6 +1173,14 @@ int f2fs_sync_fs(struct super_block *sb, int sync)
 
 static int f2fs_freeze(struct super_block *sb)
 {
+	bool busy;
+
+	mutex_lock(&F2FS_SB(sb)->extm_mutex);
+	busy = F2FS_SB(sb)->extm_leases != 0;
+	mutex_unlock(&F2FS_SB(sb)->extm_mutex);
+	if (busy)
+		return -EBUSY;
+
 	if (f2fs_readonly(sb))
 		return 0;
 
@@ -1571,7 +1583,7 @@ static void f2fs_enable_checkpoint(struct f2fs_sb_info *sbi)
 	f2fs_sync_fs(sbi->sb, 1);
 }
 
-static int f2fs_remount(struct super_block *sb, int *flags, char *data)
+static int __f2fs_remount(struct super_block *sb, int *flags, char *data)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	struct f2fs_mount_info org_mount_opt;
@@ -2242,6 +2254,25 @@ void f2fs_quota_off_umount(struct super_block *sb)
 {
 }
 #endif
+
+static int f2fs_remount(struct super_block *sb, int *flags, char *data)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(sb);
+	int ret;
+
+	mutex_lock(&sbi->extm_mutex);
+	if (sbi->extm_leases || sbi->extm_management) {
+		mutex_unlock(&sbi->extm_mutex);
+		return -EBUSY;
+	}
+	sbi->extm_management = true;
+	mutex_unlock(&sbi->extm_mutex);
+	ret = __f2fs_remount(sb, flags, data);
+	mutex_lock(&sbi->extm_mutex);
+	sbi->extm_management = false;
+	mutex_unlock(&sbi->extm_mutex);
+	return ret;
+}
 
 static const struct super_operations f2fs_sops = {
 	.alloc_inode	= f2fs_alloc_inode,
@@ -3158,6 +3189,7 @@ try_onemore:
 		return -ENOMEM;
 
 	sbi->sb = sb;
+	mutex_init(&sbi->extm_mutex);
 
 	/* Load the checksum driver */
 	sbi->s_chksum_driver = crypto_alloc_shash("crc32", 0, 0);

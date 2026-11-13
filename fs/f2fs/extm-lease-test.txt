@@ -1,0 +1,86 @@
+F2FS EXTM lease validation and limits
+====================================
+This implementation is a candidate for disposable-image validation, not a
+claim of production safety. No device test has been performed by the agent.
+
+API and lifecycle
+-----------------
+include/linux/f2fs_extm.h exports acquire, bdev, nr_extents, extents, release.
+Acquire holds its own file reference. Callers may close their temporary
+readonly file after successful acquire. Before release the caller MUST stop
+submissions, drain every raw request, and issue an underlying device flush.
+Release NEVER fsyncs the original file after raw writes. It invalidates only
+that inode's mapping, never the mounted bdev mapping.
+
+On release invalidation failure the complete lease is owned by delayed work,
+which retries every five seconds while keeping ACTIVE, deny-write, the mount,
+the superblock lease count and the F2FS module reference. It logs a rate-limited
+error. Permanent invalidation failure therefore intentionally prevents normal
+unmount/remount/freeze/module unload indefinitely. There is no force-unpin API;
+reboot/recovery is the last resort. Do not describe this as graceful shutdown.
+
+Supported/rejected files
+------------------------
+Only readonly descriptors to single ordinary F2FS files with 4096-byte pages
+and blocks, exactly matching aligned size 4096..4294967296 bytes, completely
+materialized mappings, and writable current credentials/mount are accepted.
+Encrypted, inline, atomic, volatile, swap, advisory-pinned, multi-device/zoned,
+DM-backed and loop-backed files are rejected. Immutable/append-only rejected.
+All files ever passed through this inode's mmap callback are rejected until
+inode eviction, including failed mmap attempts and already unmapped mappings.
+This deliberately closes the VFS post-mmap-callback VMA installation race.
+
+Locking and draining
+--------------------
+Acquire order: mount write reference -> provisional sbi lease count (short
+extm_mutex) -> admission write -> inode mutex -> extm_cache write -> GC WRITE
+-> GC READ -> i_mmap. GC lock group is dropped around fsync. No cp_rwsem is
+held by lease code. PREPARING prevents external entry and GC movement while
+allowing fsync/writeback to materialize existing dirty data. Read_iter uses
+admission; generic splice calls read_iter and must not wrap admission twice.
+Queued DIO is drained by inode_dio_wait. Pagecache readpage/readpages use an
+independent tryread extm_cache gate (not recursive GC locks). Invalidation
+waits locked read-ahead/writeback pages, rejects pinned pages, and must succeed
+before ACTIVE publication. The map scan allocates nothing in F2FS and checks
+valid blocks and duplicates; arrays are bounded by 1M blocks (24MiB extent
+array plus 4MiB temporary duplicate-check array at maximum).
+
+GC checks lease state both before pin auto-unpin and within the actual move
+lock domain, without treating the lease as the auto-unpinnable FI_PIN_FILE.
+Management uses a short mutex-protected in-progress marker, not a mutex held
+across freeze/shutdown. Provisional count precedes fsync/map scanning.
+Freeze's generic VFS path can already have quiesced writers/synced before the
+F2FS callback returns EBUSY. There is no earlier F2FS wrapper for generic
+freeze; no claim is made that transient quiescing is prevented. All remounts
+are conservatively rejected with any provisional/active/quarantined lease.
+
+Disposable test matrix (NOT run automatically)
+---------------------------------------------
+Use a VM and disposable real/virtual non-loop, non-DM F2FS disk, never /data.
+1. Populate aligned file without inline/holes; fsync; close every writable FD.
+   Activate target, run extm-lease-test.py with its explicit disposable flag.
+2. Before activation hold writable FD, read-only/writable mmap, queued AIO DIO,
+   read-ahead, splice pipe page refs, dirty/writeback pages in separate runs.
+   Writable FD/mmap must fail acquire; all other activity must drain or fail
+   acquire, never publish stale/unstable extents. Repeat with concurrent loops.
+3. While ACTIVE issue write/truncate/fallocate/defrag/pin/atomic/volatile ioctl,
+   and MOVE_RANGE with leased source AND leased destination. Expect rejection.
+4. Force repeated background and foreground GC while checksumming raw target;
+   leased physical map must not change and lease must never auto-unpin.
+5. On another file descriptor on same FS try resize and shutdown (all modes),
+   remount ro/rw and FIFREEZE. Expect EBUSY; no completed shutdown/freeze.
+6. Write unique patterns by DM, flush/drain/remove target, reopen original file
+   and verify patterns (including memory-pressure cached-read attempts during
+   lease). Repeated acquire/release must leave no leaked deny-write count.
+7. Inject invalidation failure at release. Check repeated quarantine log,
+   blocked original access and blocked management. Clear fault: retry must
+   invalidate, release and restore normal access. Do not force-unload F2FS.
+8. Reject zero, unaligned, >4GiB, mismatched size, holes, NEW_ADDR, encrypted,
+   inline, atomic, volatile, swap, pinned, multidevice, DM, loop and duplicate
+   block mappings (the last only through controlled fault injection).
+
+Build evidence
+--------------
+Clang 13, STB_EM_defconfig, independent O=/tmp/extm-f2fs.e8V3AL,
+CONFIG_F2FS_FS=y, CONFIG_DM_EXTM_FILE=n: complete fs/f2fs/ object build passed.
+Target-enabled/full kernel and F2FS-disabled stub matrix are coordinator work.

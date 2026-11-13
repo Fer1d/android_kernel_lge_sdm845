@@ -487,7 +487,7 @@ static loff_t f2fs_llseek(struct file *file, loff_t offset, int whence)
 	return -EINVAL;
 }
 
-static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
+static int __f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
 	int err;
@@ -503,6 +503,23 @@ static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	file_accessed(file);
 	vma->vm_ops = &f2fs_file_vm_ops;
 	return 0;
+}
+
+/* Sticky mmap history closes the VFS post-callback VMA installation window. */
+static int f2fs_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct f2fs_inode_info *fi = F2FS_I(file_inode(file));
+	int ret;
+
+	down_read(&fi->extm_admission);
+	if (READ_ONCE(fi->extm_state))
+		ret = -EBUSY;
+	else {
+		WRITE_ONCE(fi->extm_ever_mapped, true);
+		ret = __f2fs_file_mmap(file, vma);
+	}
+	up_read(&fi->extm_admission);
+	return ret;
 }
 
 static int f2fs_file_open(struct inode *inode, struct file *filp)
@@ -794,6 +811,9 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
 		return -EIO;
+
+	if (READ_ONCE(F2FS_I(inode)->extm_state))
+		return -EBUSY;
 
 	err = setattr_prepare(dentry, attr);
 	if (err)
@@ -1616,6 +1636,10 @@ static long f2fs_fallocate(struct file *file, int mode,
 		return -EOPNOTSUPP;
 
 	inode_lock(inode);
+	if (READ_ONCE(F2FS_I(inode)->extm_state)) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		if (offset >= inode->i_size)
@@ -2574,6 +2598,11 @@ static int f2fs_move_file_range(struct file *file_in, loff_t pos_in,
 			goto out;
 	}
 
+	ret = -EBUSY;
+	if (READ_ONCE(F2FS_I(src)->extm_state) ||
+	    READ_ONCE(F2FS_I(dst)->extm_state))
+		goto out_unlock;
+
 	ret = -EINVAL;
 	if (pos_in + len > src->i_size || pos_in + len < pos_in)
 		goto out_unlock;
@@ -2908,7 +2937,7 @@ static int f2fs_ioc_resize_fs(struct file *filp, unsigned long arg)
 	return ret;
 }
 
-long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long __f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(filp)))))
 		return -EIO;
@@ -2967,6 +2996,57 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 }
 
+long f2fs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct f2fs_inode_info *fi = F2FS_I(file_inode(file));
+	struct f2fs_sb_info *sbi = F2FS_I_SB(file_inode(file));
+	bool management = cmd == F2FS_IOC_SHUTDOWN || cmd == F2FS_IOC_RESIZE_FS;
+	long ret;
+
+	if (!management)
+		down_read(&fi->extm_admission);
+	if (!management && READ_ONCE(fi->extm_state)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (management) {
+		mutex_lock(&sbi->extm_mutex);
+		if (sbi->extm_leases || sbi->extm_management) {
+			mutex_unlock(&sbi->extm_mutex);
+			ret = -EBUSY;
+			goto out;
+		}
+		sbi->extm_management = true;
+		mutex_unlock(&sbi->extm_mutex);
+	}
+	ret = __f2fs_ioctl(file, cmd, arg);
+	if (management) {
+		mutex_lock(&sbi->extm_mutex);
+		sbi->extm_management = false;
+		mutex_unlock(&sbi->extm_mutex);
+	}
+ out:
+	if (!management)
+		up_read(&fi->extm_admission);
+	return ret;
+}
+
+static ssize_t f2fs_extm_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct f2fs_inode_info *fi = F2FS_I(file_inode(iocb->ki_filp));
+	ssize_t ret;
+
+	if (iocb->ki_flags & IOCB_NOWAIT) {
+		if (!down_read_trylock(&fi->extm_admission))
+			return -EAGAIN;
+	} else
+		down_read(&fi->extm_admission);
+	ret = READ_ONCE(fi->extm_state) ? -EBUSY :
+		generic_file_read_iter(iocb, to);
+	up_read(&fi->extm_admission);
+	return ret;
+}
+
 static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -2991,6 +3071,12 @@ static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			goto out;
 		}
 		inode_lock(inode);
+	}
+
+	if (READ_ONCE(F2FS_I(inode)->extm_state)) {
+		inode_unlock(inode);
+		ret = -EBUSY;
+		goto out;
 	}
 
 	ret = generic_write_checks(iocb, from);
@@ -3090,7 +3176,7 @@ long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 const struct file_operations f2fs_file_operations = {
 	.llseek		= f2fs_llseek,
-	.read_iter	= generic_file_read_iter,
+	.read_iter	= f2fs_extm_read_iter,
 	.write_iter	= f2fs_file_write_iter,
 	.open		= f2fs_file_open,
 	.release	= f2fs_release_file,

@@ -727,6 +727,11 @@ struct f2fs_inode_info {
 
 	/* avoid racing between foreground op and gc */
 	struct rw_semaphore i_gc_rwsem[2];
+	/* Admission precedes inode_lock; state is also protected by GC locks. */
+	struct rw_semaphore extm_admission;
+	struct rw_semaphore extm_cache;
+	unsigned int extm_state;
+	bool extm_ever_mapped;
 	struct rw_semaphore i_mmap_sem;
 	struct rw_semaphore i_xattr_sem; /* avoid racing between reading and changing EAs */
 
@@ -1231,6 +1236,10 @@ enum fsync_mode {
 #endif
 
 struct f2fs_sb_info {
+	/* Serializes provisional leases against destructive management. */
+	struct mutex extm_mutex;
+	unsigned int extm_leases;
+	bool extm_management;
 	struct super_block *sb;			/* pointer to VFS super block */
 	struct proc_dir_entry *s_proc;		/* proc entry */
 	struct f2fs_super_block *raw_super;	/* raw super block pointer */
