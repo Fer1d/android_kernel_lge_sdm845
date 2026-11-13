@@ -755,7 +755,7 @@ static ssize_t writeback_store(struct device *dev,
 		bio.bi_max_vecs = 1;
 		bio.bi_bdev = zram->bdev;
 		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
-		bio.bi_opf = REQ_OP_WRITE | REQ_SYNC;
+		bio_set_op_attrs(&bio, REQ_OP_WRITE, REQ_SYNC);
 
 		err = -EIO;
 		if (bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
