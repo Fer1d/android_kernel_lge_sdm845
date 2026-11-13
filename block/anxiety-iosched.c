@@ -138,6 +138,28 @@ static void anxiety_add_request(struct request_queue *q, struct request *rq)
 		rq_is_sync(rq) ? &adata->sync_queue : &adata->async_queue);
 }
 
+static struct request *
+anxiety_former_request(struct request_queue *q, struct request *rq)
+{
+	struct anxiety_data *adata = q->elevator->elevator_data;
+
+	if (rq->queuelist.prev == &adata->sync_queue ||
+	    rq->queuelist.prev == &adata->async_queue)
+		return NULL;
+	return list_prev_entry(rq, queuelist);
+}
+
+static struct request *
+anxiety_latter_request(struct request_queue *q, struct request *rq)
+{
+	struct anxiety_data *adata = q->elevator->elevator_data;
+
+	if (rq->queuelist.next == &adata->sync_queue ||
+	    rq->queuelist.next == &adata->async_queue)
+		return NULL;
+	return list_next_entry(rq, queuelist);
+}
+
 static int anxiety_init_queue(struct request_queue *q,
 		struct elevator_type *elv)
 {
@@ -169,6 +191,15 @@ static int anxiety_init_queue(struct request_queue *q,
 	spin_unlock_irq(q->queue_lock);
 
 	return 0;
+}
+
+static void anxiety_exit_queue(struct elevator_queue *e)
+{
+	struct anxiety_data *adata = e->elevator_data;
+
+	BUG_ON(!list_empty(&adata->sync_queue));
+	BUG_ON(!list_empty(&adata->async_queue));
+	kfree(adata);
 }
 
 /* Sysfs access */
@@ -228,9 +259,10 @@ static struct elevator_type elevator_anxiety = {
 		.elevator_merge_req_fn	= anxiety_merged_requests,
 		.elevator_dispatch_fn	= anxiety_dispatch,
 		.elevator_add_req_fn	= anxiety_add_request,
-		.elevator_former_req_fn	= elv_rb_former_request,
-		.elevator_latter_req_fn	= elv_rb_latter_request,
+		.elevator_former_req_fn	= anxiety_former_request,
+		.elevator_latter_req_fn	= anxiety_latter_request,
 		.elevator_init_fn	= anxiety_init_queue,
+		.elevator_exit_fn	= anxiety_exit_queue,
 	},
 	.elevator_name = "anxiety",
 	.elevator_attrs = anxiety_attrs,
