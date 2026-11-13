@@ -1027,8 +1027,6 @@ static int loop_configure(struct loop_device *lo, fmode_t mode,
 	mapping = file->f_mapping;
 	inode = mapping->host;
 
-	size = get_loop_size(lo, file);
-
 	if ((config->info.lo_flags & ~LOOP_CONFIGURE_SETTABLE_FLAGS) != 0) {
 		error = -EINVAL;
 		goto out_putf;
@@ -1073,8 +1071,10 @@ static int loop_configure(struct loop_device *lo, fmode_t mode,
 		blk_queue_logical_block_size(lo->lo_queue, bsize);
 	}
 
+	loop_config_discard(lo);
 	loop_update_dio(lo);
 	loop_sysfs_init(lo);
+	size = get_loop_size(lo, file);
 	loop_set_size(lo, size);
 
 	if (config->block_size)
@@ -1486,8 +1486,10 @@ static int lo_ioctl(struct block_device *bdev, fmode_t mode,
 	case LOOP_CONFIGURE: {
 		struct loop_config config;
 
-		if (copy_from_user(&config, argp, sizeof(config)))
-			return -EFAULT;
+		if (copy_from_user(&config, argp, sizeof(config))) {
+			err = -EFAULT;
+			break;
+		}
 
 		err = loop_configure(lo, mode, bdev, &config);
 		break;
