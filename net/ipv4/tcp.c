@@ -2554,6 +2554,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	dst_release(sk->sk_rx_dst);
 	sk->sk_rx_dst = NULL;
 	tcp_saved_syn_free(tp);
+	tp->fast_ack_mode = 0;
 	tp->segs_in = 0;
 	tp->segs_out = 0;
 	tp->bytes_acked = 0;

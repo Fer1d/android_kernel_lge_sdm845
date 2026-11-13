@@ -273,7 +273,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
 			tcp_enter_quickack_mode(sk, 2);
 		break;
 	case INET_ECN_CE:
-		if (tcp_ca_needs_ecn(sk))
+		if (tcp_ca_wants_ce_events(sk))
 			tcp_ca_event(sk, CA_EVENT_ECN_IS_CE);
 
 		if (!(tp->ecn_flags & TCP_ECN_DEMAND_CWR)) {
@@ -284,7 +284,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
 		tp->ecn_flags |= TCP_ECN_SEEN;
 		break;
 	default:
-		if (tcp_ca_needs_ecn(sk))
+		if (tcp_ca_wants_ce_events(sk))
 			tcp_ca_event(sk, CA_EVENT_ECN_NO_CE);
 		tp->ecn_flags |= TCP_ECN_SEEN;
 		break;
@@ -1006,13 +1006,29 @@ static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)
  * b) Packet has been marked both lost and retransmitted,
  *    and this means we think it was lost again.
  */
+static void tcp_notify_skb_loss_event(struct tcp_sock *tp,
+					const struct sk_buff *skb)
+{
+	struct sock *sk = (struct sock *)tp;
+	const struct tcp_congestion_ops *ca_ops = inet_csk(sk)->icsk_ca_ops;
+	struct bbr3 *bbr3 = NULL;
+
+	tp->lost += tcp_skb_pcount(skb);
+
+	if (ca_ops && strncmp(ca_ops->name, "bbr3", 4) == 0) {
+		bbr3 = *(struct bbr3 **)inet_csk_ca(sk);
+		if (bbr3 && bbr3->skb_marked_lost)
+			bbr3->skb_marked_lost(sk, skb);
+	}
+}
+
 static void tcp_sum_lost(struct tcp_sock *tp, struct sk_buff *skb)
 {
 	__u8 sacked = TCP_SKB_CB(skb)->sacked;
 
 	if (!(sacked & TCPCB_LOST) ||
 	    ((sacked & TCPCB_LOST) && (sacked & TCPCB_SACKED_RETRANS)))
-		tp->lost += tcp_skb_pcount(skb);
+		tcp_notify_skb_loss_event(tp, skb);
 }
 
 static void tcp_skb_mark_lost(struct tcp_sock *tp, struct sk_buff *skb)
@@ -1392,6 +1408,17 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
 	tcp_skb_pcount_add(prev, pcount);
 	WARN_ON_ONCE(tcp_skb_pcount(skb) < pcount);
 	tcp_skb_pcount_add(skb, -pcount);
+
+	/* Adjust tx.in_flight as pcount is shifted from skb to prev. */
+	if (WARN_ONCE(TCP_SKB_CB(skb)->tx.in_flight < pcount,
+		      "prev in_flight: %u skb in_flight: %u pcount: %u",
+		      TCP_SKB_CB(prev)->tx.in_flight,
+		      TCP_SKB_CB(skb)->tx.in_flight,
+		      pcount))
+		TCP_SKB_CB(skb)->tx.in_flight = 0;
+	else
+		TCP_SKB_CB(skb)->tx.in_flight -= pcount;
+	TCP_SKB_CB(prev)->tx.in_flight += pcount;
 
 	/* When we're adding to gso_segs == 1, gso_size will be zero,
 	 * in theory this shouldn't be necessary but as long as DSACK
@@ -3663,7 +3690,8 @@ static void tcp_replace_ts_recent(struct tcp_sock *tp, u32 seq)
 /* This routine deals with acks during a TLP episode and ends an episode by
  * resetting tlp_high_seq. Ref: TLP algorithm in draft-ietf-tcpm-rack
  */
-static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
+static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag,
+				struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -3680,6 +3708,7 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
 		/* ACK advances: there was a loss, so reduce cwnd. Reset
 		 * tlp_high_seq in tcp_init_cwnd_reduction()
 		 */
+		tcp_ca_event(sk, CA_EVENT_TLP_RECOVERY);
 		tcp_init_cwnd_reduction(sk);
 		tcp_set_ca_state(sk, TCP_CA_CWR);
 		tcp_end_cwnd_reduction(sk);
@@ -3690,6 +3719,11 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
 			     FLAG_NOT_DUP | FLAG_DATA_SACKED))) {
 		/* Pure dupack: original and TLP probe arrived; no loss */
 		tp->tlp_high_seq = 0;
+	} else {
+		/* This ACK matches a TLP retransmit. We cannot yet tell if
+		 * this ACK is for the original or the TLP retransmit.
+		 */
+		rs->is_acking_tlp_retrans_seq = 1;
 	}
 }
 
@@ -3784,6 +3818,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 
 	prior_fackets = tp->fackets_out;
 	rs.prior_in_flight = tcp_packets_in_flight(tp);
+	tcp_rate_check_app_limited(sk);
 
 	/* ts_recent update must be made after we are sure that the packet
 	 * is in window.
@@ -3858,7 +3893,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 		tcp_fastretrans_alert(sk, acked, is_dupack, &flag, &rexmit);
 	}
 	if (tp->tlp_high_seq)
-		tcp_process_tlp_ack(sk, ack, flag);
+		tcp_process_tlp_ack(sk, ack, flag, &rs);
 
 	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP)) {
 		struct dst_entry *dst = __sk_dst_get(sk);
@@ -3870,6 +3905,9 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 		tcp_schedule_loss_probe(sk);
 	delivered = tp->delivered - delivered;	/* freshly ACKed or SACKed */
 	lost = tp->lost - lost;			/* freshly marked lost */
+	/* 4.9 adaption: no FLAG_ACK_MAYBE_DELAYED; delayed-ACK heuristic off. */
+	rs.is_ack_delayed = 0;
+	rs.is_ece = !!(flag & FLAG_ECE);
 	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, &now, &rs);
 	tcp_cong_control(sk, ack, delivered, flag, &rs);
 	tcp_xmit_recovery(sk, rexmit);
@@ -3887,7 +3925,7 @@ no_queue:
 		tcp_ack_probe(sk);
 
 	if (tp->tlp_high_seq)
-		tcp_process_tlp_ack(sk, ack, flag);
+		tcp_process_tlp_ack(sk, ack, flag, &rs);
 	return 1;
 
 invalid_ack:
@@ -5456,12 +5494,19 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
 	if (((tp->rcv_nxt - tp->rcv_wup) > (inet_csk(sk)->icsk_ack.rcv_mss) *
 					sysctl_tcp_delack_seg &&
 	     /* ... and right edge of window advances far enough.
-	      * (tcp_recvmsg() will send ACK otherwise). Or...
+	      * (tcp_recvmsg() will send ACK otherwise).
+	      * If application uses SO_RCVLOWAT, we want send ack now if
+	      * we have not received enough bytes to satisfy the condition.
+	      * Or fast ack mode is enabled by congestion control (BBRv3).
 	      */
 #ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
-	     tp->ops->__select_window(sk) >= tp->rcv_wnd) ||
+	     (tp->fast_ack_mode == 1 ||
+	      tp->rcv_nxt - tp->copied_seq < sk->sk_rcvlowat ||
+	      tp->ops->__select_window(sk) >= tp->rcv_wnd)) ||
 #else
-	     __tcp_select_window(sk) >= tp->rcv_wnd) ||
+	     (tp->fast_ack_mode == 1 ||
+	      tp->rcv_nxt - tp->copied_seq < sk->sk_rcvlowat ||
+	      __tcp_select_window(sk) >= tp->rcv_wnd)) ||
 #endif
 	    /* We ACK each frame or... */
 	    tcp_in_quickack_mode(sk) ||
