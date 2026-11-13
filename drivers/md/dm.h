@@ -44,6 +44,15 @@ struct dm_dev_internal {
 
 struct dm_table;
 struct dm_md_mempools;
+struct f2fs_extm_lease;
+
+/* Trusted extm-file only; lease must outlive dm_put_device(). */
+int dm_get_device_extm(struct dm_target *ti, struct file *file,
+	const struct f2fs_extm_lease *lease,
+	struct block_device *(*lease_bdev)(const struct f2fs_extm_lease *),
+	struct dm_dev **result);
+int dm_get_table_device_extm(struct mapped_device *md, struct file *file,
+	struct block_device *leased, struct dm_dev **result);
 
 /*-----------------------------------------------------------------
  * Internal table functions.

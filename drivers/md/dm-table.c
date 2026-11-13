@@ -441,6 +441,36 @@ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
 }
 EXPORT_SYMBOL(dm_get_device);
 
+/* No F2FS symbol dependency in dm-mod: only its trusted target calls this. */
+int dm_get_device_extm(struct dm_target *ti, struct file *file,
+	const struct f2fs_extm_lease *lease,
+	struct block_device *(*lease_bdev)(const struct f2fs_extm_lease *),
+	struct dm_dev **result)
+{
+	struct dm_dev_internal *dd;
+	int r;
+
+	if (strcmp(ti->type->name, "extm-file") ||
+	    !dm_target_needs_singleton(ti->type) || ti->begin ||
+	    !file || !lease || !lease_bdev ||
+	    !list_empty(&ti->table->devices))
+		return -EINVAL;
+	dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+	if (!dd)
+		return -ENOMEM;
+	r = dm_get_table_device_extm(ti->table->md, file,
+				     lease_bdev(lease), &dd->dm_dev);
+	if (r) {
+		kfree(dd);
+		return r;
+	}
+	atomic_set(&dd->count, 1);
+	list_add(&dd->list, &ti->table->devices);
+	*result = dd->dm_dev;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dm_get_device_extm);
+
 static int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
 				sector_t start, sector_t len, void *data)
 {

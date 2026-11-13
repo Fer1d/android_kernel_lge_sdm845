@@ -213,6 +213,17 @@ config BLK_DEV_DM
 
 	  If unsure, say N.
 
+config DM_EXTM_FILE
+	tristate "F2FS stable file extent lease target"
+	depends on BLK_DEV_DM && F2FS_FS
+	default n
+	---help---
+	  Map a dedicated F2FS file through a kernel-validated stable extent
+	  lease without a loop device. Maximum mapped capacity is 4 GiB.
+	  See Documentation/device-mapper/extm-file.txt.
+
+	  If unsure, say N.
+
 config DM_MQ_DEFAULT
 	bool "request-based DM: use blk-mq I/O path by default"
 	depends on BLK_DEV_DM

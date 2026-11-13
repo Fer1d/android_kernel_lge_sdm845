@@ -22,6 +22,8 @@
 #include <linux/wait.h>
 #include <linux/pr.h>
 #include <linux/vmalloc.h>
+#include <linux/file.h>
+#include <linux/magic.h>
 
 #define DM_MSG_PREFIX "core"
 
@@ -107,6 +109,8 @@ struct table_device {
 	struct list_head list;
 	atomic_t count;
 	struct dm_dev dm_dev;
+	/* Non-NULL only for a separately claimed extm lease device. */
+	struct file *extm_file;
 };
 
 static struct kmem_cache *_io_cache;
@@ -648,6 +652,8 @@ static void close_table_device(struct table_device *td, struct mapped_device *md
 	bd_unlink_disk_holder(td->dm_dev.bdev, dm_disk(md));
 	blkdev_put(td->dm_dev.bdev, td->dm_dev.mode | FMODE_EXCL);
 	td->dm_dev.bdev = NULL;
+	if (td->extm_file)
+		fput(td->extm_file);
 }
 
 static struct table_device *find_table_device(struct list_head *l, dev_t dev,
@@ -655,7 +661,8 @@ static struct table_device *find_table_device(struct list_head *l, dev_t dev,
 	struct table_device *td;
 
 	list_for_each_entry(td, l, list)
-		if (td->dm_dev.bdev->bd_dev == dev && td->dm_dev.mode == mode)
+		if (!td->extm_file && td->dm_dev.bdev->bd_dev == dev &&
+		    td->dm_dev.mode == mode)
 			return td;
 
 	return NULL;
@@ -677,6 +684,7 @@ int dm_get_table_device(struct mapped_device *md, dev_t dev, fmode_t mode,
 
 		td->dm_dev.mode = mode;
 		td->dm_dev.bdev = NULL;
+		td->extm_file = NULL;
 
 		if ((r = open_table_device(td, dev, md))) {
 			mutex_unlock(&md->table_devices_lock);
@@ -696,6 +704,63 @@ int dm_get_table_device(struct mapped_device *md, dev_t dev, fmode_t mode,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dm_get_table_device);
+
+/*
+ * A trusted extm-file target delegates an F2FS lease's mounted-device
+ * claim.  Unlike a normal DM open this takes a NEW exclusive reference
+ * using mount_bdev's actual holder (s_type), never a borrowed raw pointer.
+ * Each lease gets a separate entry: normal targets cannot reuse this claim.
+ * The caller keeps the lease alive until after dm_put_device().
+ */
+int dm_get_table_device_extm(struct mapped_device *md, struct file *file,
+			     struct block_device *leased, struct dm_dev **result)
+{
+	struct super_block *sb = file_inode(file)->i_sb;
+	struct table_device *td;
+	struct block_device *bdev;
+	fmode_t mode = FMODE_READ | FMODE_WRITE;
+	int r;
+
+	if (!file->f_path.mnt || !S_ISREG(file_inode(file)->i_mode) ||
+	    sb->s_magic != F2FS_SUPER_MAGIC ||
+	    strcmp(sb->s_type->name, "f2fs") || !leased ||
+	    sb->s_bdev != leased || leased->bd_super != sb ||
+	    leased->bd_holder != sb->s_type || (sb->s_flags & MS_RDONLY))
+		return -EINVAL;
+
+	td = kzalloc_node(sizeof(*td), GFP_KERNEL, md->numa_node_id);
+	if (!td)
+		return -ENOMEM;
+	td->extm_file = get_file(file);
+	bdev = blkdev_get_by_dev(leased->bd_dev, mode | FMODE_EXCL, sb->s_type);
+	if (IS_ERR(bdev)) {
+		r = PTR_ERR(bdev);
+		goto bad_file;
+	}
+	if (bdev != leased) {
+		r = -ENODEV;
+		goto bad_open;
+	}
+	r = bd_link_disk_holder(bdev, dm_disk(md));
+	if (r)
+		goto bad_open;
+	td->dm_dev.bdev = bdev;
+	td->dm_dev.mode = mode;
+	format_dev_t(td->dm_dev.name, bdev->bd_dev);
+	atomic_set(&td->count, 1);
+	mutex_lock(&md->table_devices_lock);
+	list_add(&td->list, &md->table_devices);
+	mutex_unlock(&md->table_devices_lock);
+	*result = &td->dm_dev;
+	return 0;
+
+bad_open:
+	blkdev_put(bdev, mode | FMODE_EXCL);
+bad_file:
+	fput(td->extm_file);
+	kfree(td);
+	return r;
+}
 
 void dm_put_table_device(struct mapped_device *md, struct dm_dev *d)
 {

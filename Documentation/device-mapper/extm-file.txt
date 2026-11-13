@@ -1,0 +1,72 @@
+extm-file: F2FS stable file extent lease target
+================================================
+
+Table syntax:
+    0 <exact-bytes / 512> extm-file <file-path> <exact-bytes>
+
+This target is optional (CONFIG_DM_EXTM_FILE, default n). It has a natural
+tristate dependency on BLK_DEV_DM and F2FS_FS. Loading dm-mod alone does not
+load F2FS; dm-extm-file references the exported F2FS lease API.
+
+The single target must cover the whole table, starting at sector zero.
+Capacity must exactly match the leased file, be nonzero and 512-byte aligned,
+and must not exceed 4294967296 bytes. The pathname must be absolute, with
+no empty, dot or dot-dot components and no trailing slash. Each directory
+is opened and pinned separately using O_PATH|O_DIRECTORY|O_NOFOLLOW; the
+final file is opened read-only with O_NOFOLLOW relative to its pinned parent.
+No component follows a symbolic link, including under rename races.
+No userspace FIEMAP/extent array is accepted.
+The F2FS lease checks the file, filesystem and extent stability; unsupported
+underlying DM, zoned and multi-device configurations are rejected by F2FS.
+Use a dedicated, newly created file satisfying all F2FS lease restrictions.
+The lease, not a loop device or the pathname, is the authoritative identity.
+
+Mounted-device ownership
+------------------------
+Ordinary dm_get_device is unchanged: it acquires an exclusive DM holder and
+cannot claim an already mounted F2FS block device. The restricted extm helper
+instead verifies the trusted target, opaque lease's device, file mount,
+F2FS superblock identity, bd_super and the mount's actual fs_type holder. It
+then acquires a NEW blkdev_get_by_dev reference with FMODE_EXCL using that
+same fs_type holder. This is the same-holder repeated claim explicitly
+supported by this kernel's bd_may_claim and mount_bdev implementations.
+
+The registered device is not a fabricated dm_dev or a bare bdev pointer.
+It participates in table dependencies, queue limits and per-extent device
+validation. A distinct table_device owns the real exclusive open, a file
+reference pinning the mount, and the holder/slave sysfs links. Normal DM
+opens never reuse these lease-associated entries. The callback passed by
+the trusted extm target avoids a dm-mod -> F2FS symbol dependency; it is a
+kernel-internal API contract, not an authentication boundary for arbitrary
+kernel modules.
+
+I/O and lifetime
+----------------
+Only read, write and flush are supported. Discard, secure erase and write
+same are not advertised and fail with EOPNOTSUPP. Extents are binary searched
+in the immutable kernel lease map. Data bios are partially accepted only at
+extent boundaries, not forced into 4 KiB pieces. FUA is preserved. A zero-size
+flush maps directly to the underlying bdev; REQ_PREFLUSH is never partially
+accepted. This kernel's DM core splits preflush and data before target map.
+There is no passthrough ioctl or direct-access interface.
+
+A successfully acquired lease owns its own file reference. The constructor
+closes its temporary pathname fd. Inactive table replacement/clear destroys
+its unused lease through the normal target destructor. Active table
+replacement, ordinary remove and deferred remove use DM's normal table
+retirement/I/O completion lifecycle. Suspend does not release the lease.
+The destructor flushes raw backing I/O, unregisters holder links and the
+exclusive open, then releases the lease last. Flush failures are logged;
+a target destructor cannot return an error to retain a failed removal.
+F2FS handles invalidation of the backing file's mapping before unlocking its
+extents. This target never invalidates the entire mounted block device.
+
+Status (INFO and TABLE) is informational:
+    lease-v1 <backing-major:minor> <file-inode> <bytes> <extent-count>
+Numbers other than major:minor are decimal. Device and inode correspond to
+fstat(st_dev, st_ino) on the leased backing file. Userspace should additionally
+verify its own chosen DM UUID/name before treating this as mapping identity.
+It deliberately is not a reusable table pathname after rename. Do not use
+status output as a table reload source. Recreate a mapping from an explicitly
+chosen pathname and a fresh lease. Concurrent leases of the same file may
+be rejected by F2FS, including an attempted inactive reload of a live lease.
