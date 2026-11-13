@@ -344,3 +344,22 @@ Description:
 		If checkpoint=disable, it displays the number of blocks that are unusable.
                 If checkpoint=enable it displays the enumber of blocks that would be unusable
                 if checkpoint=disable were to be set.
+
+What:		/sys/fs/f2fs/<disk>/hot_data_age_threshold
+Date:		November 2026
+Contact:	"Jaegeuk Kim" <jaegeuk@kernel.org>
+Description:
+		Hot-data upper age boundary in allocated data blocks, default
+		262144 (1 GiB). Unsigned 32-bit, must be nonzero and strictly
+		below warm_data_age_threshold. Used with age_extent_cache only.
+
+What:		/sys/fs/f2fs/<disk>/warm_data_age_threshold
+Date:		November 2026
+Contact:	"Jaegeuk Kim" <jaegeuk@kernel.org>
+Description:
+		Warm-data upper age boundary in allocated data blocks, default
+		2621440 (10 GiB). Unsigned 32-bit, must be strictly above
+		hot_data_age_threshold. Larger known ages select cold data;
+		unknown/zero ages retain the existing placement policy. Updates
+		of both thresholds are serialized with classification. These
+		block-count thresholds do not change ATGC's seconds-based gate.

@@ -189,6 +189,20 @@ extent_cache           Enable an extent cache based on rb-tree, it can cache
                        as many as extent which map between contiguous logical
                        address and physical address per inode, resulting in
                        increasing the cache hit ratio. Set by default.
+age_extent_cache       Enable runtime block-age extent caching for hot/warm/cold
+                       data placement (disabled by default). Cannot be toggled
+                       by remount. Independent of extent_cache and ATGC; no
+                       on-disk format change. Unknown/zero ages use the existing
+                       placement policy. Age counts allocated data blocks, not
+                       seconds; rewrites use 70% new interval and 30% old age.
+                       sysfs hot_data_age_threshold (262144 blocks, 1 GiB) and
+                       warm_data_age_threshold (2621440 blocks, 10 GiB) require
+                       0 < hot < warm and unsigned 32-bit values. Ages <= hot
+                       are hot, <= warm are warm, otherwise cold. Existing cold
+                       hints and GC relocation policy take priority.
+                       Trace events f2fs_lookup_age_extent_tree_end and
+                       f2fs_update_age_extent_tree_range expose runtime extents;
+                       the update event explicitly marks invalidation.
 noextent_cache         Disable an extent cache based on rb-tree explicitly, see
                        the above extent_cache mount option.
 noinline_data          Disable the inline data feature, inline data feature is

@@ -261,10 +261,12 @@ get_cache:
 	si->cache_mem += si->inmem_pages * sizeof(struct inmem_pages);
 	for (i = 0; i < MAX_INO_ENTRY; i++)
 		si->cache_mem += sbi->im[i].ino_num * sizeof(struct ino_entry);
-	si->cache_mem += atomic_read(&sbi->extent_tree[EX_READ].total_ext_tree) *
+	for (i = 0; i < NR_EXTENT_CACHES; i++) {
+		si->cache_mem += atomic_read(&sbi->extent_tree[i].total_ext_tree) *
 						sizeof(struct extent_tree);
-	si->cache_mem += atomic_read(&sbi->extent_tree[EX_READ].total_ext_node) *
+		si->cache_mem += atomic_read(&sbi->extent_tree[i].total_ext_node) *
 						sizeof(struct extent_node);
+	}
 
 	si->page_mem = 0;
 	if (sbi->node_inode) {
@@ -407,6 +409,13 @@ static int stat_show(struct seq_file *s, void *v)
 				si->hit_total, si->total_ext);
 		seq_printf(s, "  - Inner Struct Count: tree: %d(%d), node: %d\n",
 				si->ext_tree, si->zombie_tree, si->ext_node);
+		seq_puts(s, "\nExtent Cache (Block Age):\n");
+		seq_printf(s, "  - Allocated Data Blocks: %llu\n",
+			(unsigned long long)atomic64_read(&si->sbi->allocated_data_blocks));
+		seq_printf(s, "  - Inner Struct Count: tree: %d(%d), node: %d\n",
+			atomic_read(&si->sbi->extent_tree[EX_BLOCK_AGE].total_ext_tree),
+			atomic_read(&si->sbi->extent_tree[EX_BLOCK_AGE].total_zombie_tree),
+			atomic_read(&si->sbi->extent_tree[EX_BLOCK_AGE].total_ext_node));
 		seq_puts(s, "\nBalancing F2FS Async:\n");
 		seq_printf(s, "  - DIO (R: %4d, W: %4d)\n",
 			   si->nr_dio_read, si->nr_dio_write);

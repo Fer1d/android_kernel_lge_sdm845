@@ -319,6 +319,23 @@ out:
 		return count;
 	}
 
+	if (!strcmp(a->attr.name, "hot_data_age_threshold") ||
+	    !strcmp(a->attr.name, "warm_data_age_threshold")) {
+		bool hot = !strcmp(a->attr.name, "hot_data_age_threshold");
+
+		if (!t || t > UINT_MAX)
+			return -EINVAL;
+		spin_lock(&sbi->age_threshold_lock);
+		if ((hot && t >= sbi->warm_data_age_threshold) ||
+		    (!hot && t <= sbi->hot_data_age_threshold)) {
+			spin_unlock(&sbi->age_threshold_lock);
+			return -EINVAL;
+		}
+		WRITE_ONCE(*ui, (unsigned int)t);
+		spin_unlock(&sbi->age_threshold_lock);
+		return count;
+	}
+
 	if (!strcmp(a->attr.name, "discard_granularity")) {
 		if (t == 0 || t > MAX_PLIST_NUM)
 			return -EINVAL;
@@ -595,8 +612,13 @@ F2FS_FEATURE_RO_ATTR(inode_crtime, FEAT_INODE_CRTIME);
 F2FS_FEATURE_RO_ATTR(lost_found, FEAT_LOST_FOUND);
 F2FS_FEATURE_RO_ATTR(sb_checksum, FEAT_SB_CHECKSUM);
 
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, hot_data_age_threshold, hot_data_age_threshold);
+F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, warm_data_age_threshold, warm_data_age_threshold);
+
 #define ATTR_LIST(name) (&f2fs_attr_##name.attr)
 static struct attribute *f2fs_attrs[] = {
+	ATTR_LIST(hot_data_age_threshold),
+	ATTR_LIST(warm_data_age_threshold),
 	ATTR_LIST(reclaim_segments),
 	ATTR_LIST(max_small_discards),
 	ATTR_LIST(discard_granularity),

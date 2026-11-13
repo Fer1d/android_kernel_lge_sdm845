@@ -101,6 +101,7 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define F2FS_MOUNT_INLINE_XATTR_SIZE	0x00800000
 #define F2FS_MOUNT_RESERVE_ROOT		0x01000000
 #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
+#define F2FS_MOUNT_AGE_EXTENT_CACHE	0x20000000
 #define F2FS_MOUNT_ATGC			0x08000000
 #define F2FS_MOUNT_GC_MERGE		0x10000000
 
@@ -558,6 +559,10 @@ enum {
 
 /* number of extent info in extent cache we try to shrink */
 #define EXTENT_CACHE_SHRINK_NUMBER	128
+#define LAST_AGE_WEIGHT			30
+#define SAME_AGE_REGION			1024
+#define DEF_HOT_DATA_AGE_THRESHOLD	262144
+#define DEF_WARM_DATA_AGE_THRESHOLD	2621440
 
 struct rb_entry {
 	struct rb_node rb_node;		/* rb node located in rb-tree */
@@ -776,22 +781,27 @@ static inline bool __is_discard_front_mergeable(struct discard_info *cur,
 }
 
 static inline bool __is_extent_mergeable(struct extent_info *back,
-						struct extent_info *front)
+						struct extent_info *front, enum extent_type type)
 {
+	if (type == EX_BLOCK_AGE)
+		return back->fofs + back->len == front->fofs &&
+			max(back->age, front->age) - min(back->age, front->age) <= SAME_AGE_REGION &&
+			max(back->last_blocks, front->last_blocks) -
+			min(back->last_blocks, front->last_blocks) <= SAME_AGE_REGION;
 	return (back->fofs + back->len == front->fofs &&
 			back->blk + back->len == front->blk);
 }
 
 static inline bool __is_back_mergeable(struct extent_info *cur,
-						struct extent_info *back)
+						struct extent_info *back, enum extent_type type)
 {
-	return __is_extent_mergeable(back, cur);
+	return __is_extent_mergeable(back, cur, type);
 }
 
 static inline bool __is_front_mergeable(struct extent_info *cur,
-						struct extent_info *front)
+						struct extent_info *front, enum extent_type type)
 {
-	return __is_extent_mergeable(cur, front);
+	return __is_extent_mergeable(cur, front, type);
 }
 
 extern void f2fs_mark_inode_dirty_sync(struct inode *inode, bool sync);
@@ -1277,6 +1287,10 @@ struct f2fs_sb_info {
 
 	/* for extent tree cache */
 	struct extent_tree_info extent_tree[NR_EXTENT_CACHES];
+	atomic64_t allocated_data_blocks;
+	spinlock_t age_threshold_lock;
+	unsigned int hot_data_age_threshold;
+	unsigned int warm_data_age_threshold;
 
 	/* basic filesystem units */
 	unsigned int log_sectors_per_block;	/* log2 sectors per block */
@@ -3619,6 +3633,12 @@ bool f2fs_lookup_extent_cache(struct inode *inode, pgoff_t pgofs,
 void f2fs_update_extent_cache(struct dnode_of_data *dn);
 void f2fs_update_extent_cache_range(struct dnode_of_data *dn,
 			pgoff_t fofs, block_t blkaddr, unsigned int len);
+void f2fs_init_age_extent_tree(struct inode *inode);
+bool f2fs_lookup_age_extent_cache(struct inode *inode, pgoff_t pgofs,
+			struct extent_info *ei);
+void f2fs_update_age_extent_cache(struct dnode_of_data *dn);
+void f2fs_invalidate_age_extent_cache_range(struct inode *inode,
+			pgoff_t fofs, unsigned int len);
 void f2fs_init_extent_cache_info(struct f2fs_sb_info *sbi);
 int __init f2fs_create_extent_cache(void);
 void f2fs_destroy_extent_cache(void);

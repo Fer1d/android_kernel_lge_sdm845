@@ -3196,10 +3196,30 @@ static int __get_segment_type_4(struct f2fs_io_info *fio)
 	}
 }
 
+static int __get_age_segment_type(struct inode *inode, pgoff_t pgofs)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct extent_info ei;
+	int type = NO_CHECK_TYPE;
+
+	if (!f2fs_lookup_age_extent_cache(inode, pgofs, &ei) || !ei.age)
+		return type;
+	spin_lock(&sbi->age_threshold_lock);
+	if (ei.age <= sbi->hot_data_age_threshold)
+		type = CURSEG_HOT_DATA;
+	else if (ei.age <= sbi->warm_data_age_threshold)
+		type = CURSEG_WARM_DATA;
+	else
+		type = CURSEG_COLD_DATA;
+	spin_unlock(&sbi->age_threshold_lock);
+	return type;
+}
+
 static int __get_segment_type_6(struct f2fs_io_info *fio)
 {
 	if (fio->type == DATA) {
 		struct inode *inode = fio->page->mapping->host;
+		int type;
 
 		if (is_cold_data(fio->page)) {
 			if (fio->sbi->am.atgc_enabled &&
@@ -3211,6 +3231,9 @@ static int __get_segment_type_6(struct f2fs_io_info *fio)
 		}
 		if (file_is_cold(inode))
 			return CURSEG_COLD_DATA;
+		type = __get_age_segment_type(inode, fio->page->index);
+		if (type != NO_CHECK_TYPE)
+			return type;
 		if (file_is_hot(inode) ||
 				is_inode_flag_set(inode, FI_HOT_DATA) ||
 				f2fs_is_atomic_file(inode) ||
@@ -3320,6 +3343,9 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	 */
 	locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
 	locate_dirty_segment(sbi, GET_SEGNO(sbi, *new_blkaddr));
+
+	if (test_opt(sbi, AGE_EXTENT_CACHE) && IS_DATASEG(curseg->seg_type))
+		atomic64_inc(&sbi->allocated_data_blocks);
 
 	up_write(&sit_i->sentry_lock);
 
@@ -3438,6 +3464,8 @@ void f2fs_outplace_write_data(struct dnode_of_data *dn,
 	struct f2fs_summary sum;
 
 	f2fs_bug_on(sbi, dn->data_blkaddr == NULL_ADDR);
+	if (fio->io_type == FS_DATA_IO || fio->io_type == FS_CP_DATA_IO)
+		f2fs_update_age_extent_cache(dn);
 	set_summary(&sum, dn->nid, dn->ofs_in_node, fio->version);
 	do_write_page(&sum, fio);
 	f2fs_update_data_blkaddr(dn, fio->new_blkaddr);

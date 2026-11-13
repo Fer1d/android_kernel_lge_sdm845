@@ -82,10 +82,15 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 		mem_size >>= PAGE_SHIFT;
 		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
 	} else if (type == EXTENT_CACHE) {
-		mem_size = (atomic_read(&sbi->extent_tree[EX_READ].total_ext_tree) *
+		int etype;
+
+		mem_size = 0;
+		for (etype = 0; etype < NR_EXTENT_CACHES; etype++)
+			mem_size += atomic_read(&sbi->extent_tree[etype].total_ext_tree) *
 				sizeof(struct extent_tree) +
-				atomic_read(&sbi->extent_tree[EX_READ].total_ext_node) *
-				sizeof(struct extent_node)) >> PAGE_SHIFT;
+				atomic_read(&sbi->extent_tree[etype].total_ext_node) *
+				sizeof(struct extent_node);
+		mem_size >>= PAGE_SHIFT;
 		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
 	} else if (type == INMEM_PAGES) {
 		/* it allows 20% / total_ram for inmemory pages */
