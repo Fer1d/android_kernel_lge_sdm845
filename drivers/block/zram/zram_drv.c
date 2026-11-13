@@ -142,6 +142,24 @@ static void zram_set_obj_size(struct zram *zram,
 	zram->table[index].flags = (flags << ZRAM_FLAG_SHIFT) | size;
 }
 
+/* Reclassify only the object being installed, under its slot lock. */
+static void zram_update_low_compress(struct zram *zram, u32 index, size_t size)
+{
+	unsigned int ratio = READ_ONCE(low_compress_ratio);
+	bool low = ratio && (100 * (PAGE_SIZE - size) / PAGE_SIZE) < ratio;
+
+	if (low == zram_test_flag(zram, index, ZRAM_COMPRESS_LOW))
+		return;
+
+	if (low) {
+		zram_set_flag(zram, index, ZRAM_COMPRESS_LOW);
+		atomic64_inc(&zram->stats.lowratio_pages);
+	} else {
+		zram_clear_flag(zram, index, ZRAM_COMPRESS_LOW);
+		atomic64_dec(&zram->stats.lowratio_pages);
+	}
+}
+
 static inline void zram_set_priority(struct zram *zram, u32 index, u32 prio)
 {
 	prio &= ZRAM_COMP_PRIORITY_MASK;
@@ -650,14 +668,73 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 #define PAGE_WRITEBACK 0
 #define HUGE_WRITEBACK 1
 #define IDLE_WRITEBACK 2
+#define FILTERED_IDLE_WRITEBACK 3
 
+/* Extended source syntax: idle <max_pages> [idle_count]. */
+static int writeback_parse_filter(const char *buf, size_t len,
+		unsigned long *max_pages, unsigned int *idle_count)
+{
+	char *args, *arg, *argbuf;
+	int ret = -EINVAL;
+
+	if (len && buf[len - 1] == '\n')
+		len--;
+	if (!len || memchr(buf, '\n', len) || memchr(buf, '\0', len))
+		return -EINVAL;
+
+	args = argbuf = kstrndup(buf, len, GFP_KERNEL);
+	if (!argbuf)
+		return -ENOMEM;
+
+	arg = strsep(&args, " ");
+	if (strcmp(arg, "idle"))
+		goto out;
+	arg = strsep(&args, " ");
+	if (!arg || kstrtoul(arg, 10, max_pages))
+		goto out;
+	if (args) {
+		arg = strsep(&args, " ");
+		if (kstrtouint(arg, 10, idle_count) || args)
+			goto out;
+		*idle_count = min_t(unsigned int, *idle_count, ZRAM_IDLE_COUNT_MAX);
+	}
+	ret = 0;
+out:
+	kfree(argbuf);
+	return ret;
+}
+
+static bool zram_writeback_match(struct zram *zram, u32 index, int mode,
+		unsigned int idle_count)
+{
+	if (!zram_allocated(zram, index) ||
+	    zram_test_flag(zram, index, ZRAM_WB) ||
+	    zram_test_flag(zram, index, ZRAM_SAME) ||
+	    zram_test_flag(zram, index, ZRAM_UNDER_WB))
+		return false;
+
+	switch (mode) {
+	case FILTERED_IDLE_WRITEBACK:
+		if (!zram_test_flag(zram, index, ZRAM_COMPRESS_LOW) ||
+		    zram_idle_count(zram, index) < idle_count)
+			return false;
+		/* fall through */
+	case IDLE_WRITEBACK:
+		return zram_test_flag(zram, index, ZRAM_IDLE);
+	case HUGE_WRITEBACK:
+		return zram_test_flag(zram, index, ZRAM_HUGE);
+	default:
+		return true;
+	}
+}
 
 static ssize_t writeback_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
 	struct zram *zram = dev_to_zram(dev);
-	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	unsigned long index = 0;
+	unsigned long nr_pages;
+	unsigned long index = 0, max_pages = ULONG_MAX, written = 0;
+	unsigned int idle_count = 1;
 	struct bio bio;
 	struct bio_vec bio_vec;
 	struct page *page;
@@ -669,15 +746,18 @@ static ssize_t writeback_store(struct device *dev,
 		mode = IDLE_WRITEBACK;
 	else if (sysfs_streq(buf, "huge"))
 		mode = HUGE_WRITEBACK;
-	else {
+	else if (!strncmp(buf, "idle ", 5)) {
+		err = writeback_parse_filter(buf, len, &max_pages, &idle_count);
+		if (err)
+			return err;
+		mode = FILTERED_IDLE_WRITEBACK;
+	} else {
 		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
 			return -EINVAL;
 
-		if (kstrtol(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index) ||
-				index >= nr_pages)
+		if (kstrtoul(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index))
 			return -EINVAL;
 
-		nr_pages = 1;
 		mode = PAGE_WRITEBACK;
 	}
 
@@ -692,13 +772,24 @@ static ssize_t writeback_store(struct device *dev,
 		goto release_init_lock;
 	}
 
+	nr_pages = zram->disksize >> PAGE_SHIFT;
+	if (mode == PAGE_WRITEBACK) {
+		if (index >= nr_pages) {
+			ret = -EINVAL;
+			goto release_init_lock;
+		}
+		nr_pages = 1;
+	}
+	if (!max_pages)
+		goto release_init_lock;
+
 	page = alloc_page(GFP_KERNEL);
 	if (!page) {
 		ret = -ENOMEM;
 		goto release_init_lock;
 	}
 
-	for (; nr_pages != 0; index++, nr_pages--) {
+	for (; nr_pages && written < max_pages; index++, nr_pages--) {
 		struct bio_vec bvec;
 
 		bvec.bv_page = page;
@@ -722,19 +813,7 @@ static ssize_t writeback_store(struct device *dev,
 		}
 
 		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index))
-			goto next;
-
-		if (zram_test_flag(zram, index, ZRAM_WB) ||
-				zram_test_flag(zram, index, ZRAM_SAME) ||
-				zram_test_flag(zram, index, ZRAM_UNDER_WB))
-			goto next;
-
-		if (mode == IDLE_WRITEBACK &&
-			  !zram_test_flag(zram, index, ZRAM_IDLE))
-			goto next;
-		if (mode == HUGE_WRITEBACK &&
-			  !zram_test_flag(zram, index, ZRAM_HUGE))
+		if (!zram_writeback_match(zram, index, mode, idle_count))
 			goto next;
 		/*
 		 * Clearing ZRAM_UNDER_WB is duty of caller.
@@ -806,6 +885,7 @@ static ssize_t writeback_store(struct device *dev,
 		zram_set_flag(zram, index, ZRAM_WB);
 		zram_set_element(zram, index, blk_idx);
 		blk_idx = 0;
+		written++;
 		atomic64_inc(&zram->stats.pages_stored);
 		spin_lock(&zram->wb_limit_lock);
 		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
@@ -1292,7 +1372,7 @@ static ssize_t mm_stat_show(struct device *dev,
 static ssize_t low_compress_ratio_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%u\n", low_compress_ratio);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(low_compress_ratio));
 }
 
 static ssize_t low_compress_ratio_store(struct device *dev,
@@ -1303,7 +1383,8 @@ static ssize_t low_compress_ratio_store(struct device *dev,
 	if (kstrtouint(buf, 10, &value) || value > 100)
 		return -EINVAL;
 
-	low_compress_ratio = value;
+	/* Existing objects retain their classification until replaced. */
+	WRITE_ONCE(low_compress_ratio, value);
 	return len;
 }
 
@@ -1473,7 +1554,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 	unsigned long handle;
 
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
-	zram->table[index].ac_time = 0;
+	zram->table[index].ac_time = ktime_set(0, 0);
 #endif
 	if (zram_test_flag(zram, index, ZRAM_IDLE))
 		zram_clear_flag(zram, index, ZRAM_IDLE);
@@ -1779,12 +1860,7 @@ out:
 	}  else {
 		zram_set_handle(zram, index, handle);
 		zram_set_obj_size(zram, index, comp_len);
-		if (low_compress_ratio &&
-		    (100 * (PAGE_SIZE - comp_len) / PAGE_SIZE) <
-				low_compress_ratio) {
-			zram_set_flag(zram, index, ZRAM_COMPRESS_LOW);
-			atomic64_inc(&zram->stats.lowratio_pages);
-		}
+		zram_update_low_compress(zram, index, comp_len);
 	}
 	zram_slot_unlock(zram, index);
 
@@ -2157,9 +2233,9 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 			       __GFP_NOWARN |
 			       __GFP_HIGHMEM |
 			       __GFP_MOVABLE);
-	if (IS_ERR_VALUE(handle_new)) {
+	if (!handle_new) {
 		zcomp_stream_put(zram->comps[prio]);
-		return PTR_ERR((void *)handle_new);
+		return -ENOMEM;
 	}
 
 	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
@@ -2172,6 +2248,7 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 	zram_set_handle(zram, index, handle_new);
 	zram_set_obj_size(zram, index, comp_len_new);
 	zram_set_priority(zram, index, prio);
+	zram_update_low_compress(zram, index, comp_len_new);
 
 	atomic64_add(comp_len_new, &zram->stats.compr_data_size);
 	atomic64_inc(&zram->stats.pages_stored);

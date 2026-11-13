@@ -63,8 +63,9 @@ enum zram_pageflags {
 };
 
 /*
- * The upper bits of table[index].flags count how many idle-marking
- * generations a page has survived.
+ * Cumulative idle markings of this object, saturated at 10. Access clears
+ * ZRAM_IDLE but not this count: these are not consecutive idle generations.
+ * Free/replacement and writing "all" to new reset the count.
  */
 #define ZRAM_IDLE_COUNT_SHIFT	__NR_ZRAM_PAGEFLAGS
 #define ZRAM_IDLE_COUNT_MAX	10

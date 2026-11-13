@@ -210,6 +210,10 @@ compact           	WO	trigger memory compaction
 debug_stat        	RO	this file is used for zram debugging purposes
 backing_dev	  	RW	set up backend storage for zram to write out
 idle		  	WO	mark allocated slot as idle
+new			WO	write "all" to clear idle flags and counts
+idle_stat		RO	allocated slots with 1..10 cumulative idle markings
+new_stat		RO	allocated slots with zero idle markings
+low_compress_ratio	RW	global minimum memory-saving percentage (default 75)
 
 
 User space is advised to use the following files to read the device statistics.
@@ -298,7 +302,7 @@ To use the feature, admin should set up backing device via
 before disksize setting. It supports only partition at this moment.
 If admin want to use incompressible page writeback, they could do via
 
-	"echo huge > /sys/block/zramX/write"
+	"echo huge > /sys/block/zramX/writeback"
 
 To use idle page writeback, first, user need to declare zram pages
 as idle.
@@ -314,6 +318,51 @@ Admin can request writeback of those idle pages at right timing via
 	"echo idle > /sys/block/zramX/writeback"
 
 With the command, zram writeback idle pages from memory to the storage.
+The bare "idle" command retains its original meaning: it does not filter by
+compression savings or idle count. "huge" and "page_index=<index>" likewise
+retain their original selection rules. Same-filled, already written-back and
+under-writeback slots are excluded in all modes.
+
+To explicitly select only idle pages with low compression savings, use:
+
+	"echo 'idle 32' > /sys/block/zramX/writeback"
+	"echo 'idle 32 3' > /sys/block/zramX/writeback"
+
+The syntax is "idle <max_pages> [idle_count]", using single spaces and decimal
+unsigned numbers, with an optional final newline. max_pages is required and
+counts successfully installed backing pages in this request, not scanned pages,
+I/O attempts or 4KB units. Zero selects no pages. idle_count defaults to 1;
+values above 10 are clamped to 10. Zero removes only the count requirement:
+the page must still have its IDLE and low-compression flags set. Extra arguments,
+empty arguments, negative values and numeric overflow are rejected. There is no
+implicit low-compression filter for the bare "idle" command.
+
+The count is the cumulative number of "all" writes to idle seen by this object,
+saturating at 10; it is NOT a count of consecutive idle generations or an elapsed
+age. Access clears the IDLE flag but does not reset this existing counter.
+Consequently, an accessed page can pass a higher count after being marked idle
+again. Freeing/replacing the object (including successful recompression), or
+writing "all" to new, resets the count. idle_stat reports allocated slots in
+count buckets 1 through 10, even if their current IDLE flag is clear; new_stat
+reports allocated slots in bucket zero. These statistics are not restricted to
+low-compression pages. Slots under writeback are not marked by idle.
+
+low_compress_ratio is a global setting shared by all zram devices, default 75,
+and accepts 0..100. An in-memory, non-same-filled object is flagged low when
+floor(100 * (PAGE_SIZE - stored_size) / PAGE_SIZE) is strictly less than the
+setting. Zero disables classification for newly installed objects. Changing the
+setting does NOT rescan or reclassify existing objects: their flags and the
+lowratio_pages field (last column of mm_stat) retain installation-time meaning.
+New writes and successful recompression classify the newly installed size using
+a single snapshot of the current setting. Failed or skipped recompression keeps
+the old classification. Disabling the setting therefore does not immediately
+remove old low flags or exclude those old objects from explicit writeback.
+
+Writeback still uses synchronous single-page I/O, not a 32-page batch. The
+per-request max_pages does not replace the existing device writeback budget.
+Errors may be returned after earlier pages were written; completed writeback is
+not rolled back. A slot freed, rewritten or accessed during I/O is not replaced
+by that writeback's saved contents.
 
 If there are lots of write IO with flash device, potentially, it has
 flash wearout problem so that admin needs to design write limitation
