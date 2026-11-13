@@ -29,6 +29,7 @@ enum {
 #endif
 	RESERVED_BLOCKS,	/* struct f2fs_sb_info */
 	GC_THREAD,	/* struct f2fs_gc_kthread */
+	ATGC_INFO,	/* struct atgc_management */
 };
 
 static const char *gc_mode_names[MAX_GC_MODE] = {
@@ -63,6 +64,8 @@ static unsigned char *__struct_ptr(struct f2fs_sb_info *sbi, int struct_type)
 		return (unsigned char *)sbi;
 	else if (struct_type == GC_THREAD)
 		return (unsigned char *)sbi->gc_thread;
+	else if (struct_type == ATGC_INFO)
+		return (unsigned char *)&sbi->am;
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 	else if (struct_type == FAULT_INFO_RATE ||
 					struct_type == FAULT_INFO_TYPE)
@@ -154,6 +157,13 @@ static ssize_t current_reserved_blocks_show(struct f2fs_attr *a,
 	return snprintf(buf, PAGE_SIZE, "%u\n", sbi->current_reserved_blocks);
 }
 
+static ssize_t atgc_enabled_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	/* Fixed during GC manager initialization, before sysfs registration. */
+	return snprintf(buf, PAGE_SIZE, "%u\n", sbi->am.atgc_enabled);
+}
+
 static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi, char *buf)
 {
@@ -163,6 +173,18 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 	ptr = __struct_ptr(sbi, a->struct_type);
 	if (!ptr)
 		return -EINVAL;
+
+	if (a->struct_type == ATGC_INFO) {
+		unsigned long long value;
+
+		mutex_lock(&DIRTY_I(sbi)->seglist_lock);
+		if (!strcmp(a->attr.name, "atgc_age_threshold"))
+			value = sbi->am.age_threshold;
+		else
+			value = *(unsigned int *)(ptr + a->offset);
+		mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
+		return snprintf(buf, PAGE_SIZE, "%llu\n", value);
+	}
 
 	if (!strcmp(a->attr.name, "extension_list")) {
 		__u8 (*extlist)[F2FS_EXTENSION_LEN] =
@@ -213,6 +235,29 @@ static ssize_t __sbi_store(struct f2fs_attr *a,
 	ptr = __struct_ptr(sbi, a->struct_type);
 	if (!ptr)
 		return -EINVAL;
+
+	if (a->struct_type == ATGC_INFO) {
+		unsigned long long value;
+		bool threshold = !strcmp(a->attr.name, "atgc_age_threshold");
+
+		ret = kstrtoull(skip_spaces(buf), 0, &value);
+		if (ret)
+			return ret;
+		if (!threshold && value > UINT_MAX)
+			return -EINVAL;
+		if ((!strcmp(a->attr.name, "atgc_candidate_ratio") ||
+		     !strcmp(a->attr.name, "atgc_age_weight")) && value > 100)
+			return -EINVAL;
+
+		/* Serialize with the entire victim selection, not just a field load. */
+		mutex_lock(&DIRTY_I(sbi)->seglist_lock);
+		if (threshold)
+			sbi->am.age_threshold = value;
+		else
+			*(unsigned int *)(ptr + a->offset) = (unsigned int)value;
+		mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
+		return count;
+	}
 
 	if (!strcmp(a->attr.name, "extension_list")) {
 		const char *name = strim((char *)buf);
@@ -528,6 +573,12 @@ F2FS_GENERAL_RO_ATTR(features);
 F2FS_GENERAL_RO_ATTR(current_reserved_blocks);
 F2FS_GENERAL_RO_ATTR(unusable);
 
+F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_candidate_ratio, candidate_ratio);
+F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_candidate_count, max_candidate_count);
+F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_age_weight, age_weight);
+F2FS_RW_ATTR(ATGC_INFO, atgc_management, atgc_age_threshold, age_threshold);
+F2FS_GENERAL_RO_ATTR(atgc_enabled);
+
 #ifdef CONFIG_FS_ENCRYPTION
 F2FS_FEATURE_RO_ATTR(encryption, FEAT_CRYPTO);
 #endif
@@ -576,6 +627,11 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(gc_reclaimed_segments),
 	ATTR_LIST(gc_urgent_high_remaining),
 	ATTR_LIST(extension_list),
+	ATTR_LIST(atgc_candidate_ratio),
+	ATTR_LIST(atgc_candidate_count),
+	ATTR_LIST(atgc_age_weight),
+	ATTR_LIST(atgc_age_threshold),
+	ATTR_LIST(atgc_enabled),
 #ifdef CONFIG_F2FS_FAULT_INJECTION
 	ATTR_LIST(inject_rate),
 	ATTR_LIST(inject_type),
@@ -774,7 +830,7 @@ int __init f2fs_init_sysfs(void)
 {
 	int ret;
 
-	kobject_set_name(&f2fs_kset.kobj, "f2fs_dev");
+	kobject_set_name(&f2fs_kset.kobj, "f2fs");
 	f2fs_kset.kobj.parent = fs_kobj;
 	ret = kset_register(&f2fs_kset);
 	if (ret)
@@ -785,7 +841,7 @@ int __init f2fs_init_sysfs(void)
 	if (ret)
 		kset_unregister(&f2fs_kset);
 	else
-		f2fs_proc_root = proc_mkdir("fs/f2fs_dev", NULL);
+		f2fs_proc_root = proc_mkdir("fs/f2fs", NULL);
 	return ret;
 }
 
@@ -793,7 +849,7 @@ void f2fs_exit_sysfs(void)
 {
 	kobject_put(&f2fs_feat);
 	kset_unregister(&f2fs_kset);
-	remove_proc_entry("fs/f2fs_dev", NULL);
+	remove_proc_entry("fs/f2fs", NULL);
 	f2fs_proc_root = NULL;
 }
 

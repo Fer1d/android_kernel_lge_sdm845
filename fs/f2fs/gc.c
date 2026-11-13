@@ -745,9 +745,10 @@ static void atgc_lookup_victim(struct f2fs_sb_info *sbi,
 	unsigned long long min_mtime = sit_i->dirty_min_mtime;
 	unsigned int sec_blocks = BLKS_PER_SEC(sbi);
 	unsigned int vblocks;
+	/* Promote before multiplying; the percentage still fits unsigned int. */
 	unsigned int dirty_threshold = max(am->max_candidate_count,
-					am->candidate_ratio *
-					am->victim_count / 100);
+			(unsigned int)div_u64((u64)am->candidate_ratio *
+						am->victim_count, 100));
 	unsigned int age_weight = am->age_weight;
 	unsigned int cost;
 	unsigned int iter = 0;
@@ -819,9 +820,10 @@ static void atssr_lookup_victim(struct f2fs_sb_info *sbi,
 	unsigned long long min_mtime = sit_i->dirty_min_mtime;
 	unsigned int seg_blocks = sbi->blocks_per_seg;
 	unsigned int vblocks;
+	/* Promote before multiplying; the percentage still fits unsigned int. */
 	unsigned int dirty_threshold = max(am->max_candidate_count,
-					am->candidate_ratio *
-					am->victim_count / 100);
+			(unsigned int)div_u64((u64)am->candidate_ratio *
+						am->victim_count, 100));
 	unsigned int cost;
 	unsigned int iter = 0;
 	int stage = 0;
