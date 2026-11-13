@@ -1021,6 +1021,24 @@ config NUMA_BALANCING_DEFAULT_ENABLED
 	  If set, automatic NUMA balancing will be enabled if running on a NUMA
 	  machine.
 
+config UCLAMP_TASK
+	bool "Utilization clamping for FAIR and RT tasks"
+	default n
+	help
+	  Track runnable task utilization hints, supplied through sched_setattr.
+	  Minimum and maximum hints do not reserve bandwidth. Scheduler and
+	  frequency consumers must be integrated before enabling this feature.
+	  WALT and SchedTune remain available. If unsure, say N.
+
+config UCLAMP_BUCKETS_COUNT
+	int "Number of utilization clamp buckets"
+	depends on UCLAMP_TASK
+	range 5 20
+	default 5
+	help
+	  More buckets reduce the bounded overboost from bucket-local maximum
+	  aggregation, at the cost of per-runqueue memory.
+
 menuconfig CGROUPS
 	bool "Control Group support"
 	select KERNFS
@@ -1214,6 +1232,15 @@ config RT_GROUP_SCHED
 	  schedule realtime tasks for non-root users until you allocate
 	  realtime bandwidth for them.
 	  See Documentation/scheduler/sched-rt-group.txt for more information.
+
+config UCLAMP_TASK_GROUP
+	bool "Utilization clamping for CPU task groups"
+	depends on UCLAMP_TASK && CGROUP_SCHED
+	default n
+	help
+	  Expose cpu.uclamp.min/max for non-root CPU cgroups. Requests are
+	  restricted by ancestors and immediately applied to runnable tasks.
+	  This is independent of the CFS bandwidth controller.
 
 endif #CGROUP_SCHED
 

@@ -62,6 +62,7 @@ struct sched_param {
 #include <asm/processor.h>
 
 #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
+#define SCHED_ATTR_SIZE_VER1	56	/* utilization clamp extension */
 
 /*
  * Extended scheduling parameters data structure.
@@ -123,6 +124,10 @@ struct sched_attr {
 	u64 sched_runtime;
 	u64 sched_deadline;
 	u64 sched_period;
+
+	/* Utilization hints, in [0, 1024]; ~0U resets a requested clamp. */
+	u32 sched_util_min;
+	u32 sched_util_max;
 };
 
 struct futex_pi_state;
@@ -982,6 +987,12 @@ extern struct user_struct root_user;
 struct backing_dev_info;
 struct reclaim_state;
 
+enum uclamp_id {
+	UCLAMP_MIN = 0,
+	UCLAMP_MAX,
+	UCLAMP_CNT
+};
+
 #ifdef CONFIG_SCHED_INFO
 struct sched_info {
 	/* cumulative counters */
@@ -1540,6 +1551,18 @@ struct ravg {
 	u8 busy_buckets[NUM_BUSY_BUCKETS];
 };
 
+#ifdef CONFIG_UCLAMP_TASK
+#define UCLAMP_BUCKETS CONFIG_UCLAMP_BUCKETS_COUNT
+
+/* Requested/effective clamp; active belongs only to the effective copy. */
+struct uclamp_se {
+	unsigned int value;
+	unsigned int bucket_id;
+	bool active;
+	bool user_defined;
+};
+#endif
+
 struct sched_entity {
 	struct load_weight	load;		/* for load-balancing */
 	struct rb_node		run_node;
@@ -1733,6 +1756,10 @@ struct task_struct {
 	struct task_group *sched_task_group;
 #endif
 	struct sched_dl_entity dl;
+#ifdef CONFIG_UCLAMP_TASK
+	struct uclamp_se uclamp_req[UCLAMP_CNT];
+	struct uclamp_se uclamp[UCLAMP_CNT];
+#endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
@@ -3951,6 +3978,7 @@ static inline unsigned long rlimit_max(unsigned int limit)
 #define SCHED_CPUFREQ_PL	(1U << 5)
 #define SCHED_CPUFREQ_EARLY_DET	(1U << 6)
 #define SCHED_CPUFREQ_FORCE_UPDATE (1U << 7)
+#define SCHED_CPUFREQ_UCLAMP (1U << 8)
 
 #define SCHED_CPUFREQ_RT_DL	(SCHED_CPUFREQ_RT | SCHED_CPUFREQ_DL)
 

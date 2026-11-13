@@ -1,0 +1,144 @@
+Utilization clamping core
+=========================
+
+Scope and configuration
+-----------------------
+CONFIG_UCLAMP_TASK tracks utilization requests for FAIR and RT tasks, including
+PI class transitions. CONFIG_UCLAMP_TASK_GROUP adds CPU-controller cgroup files
+and depends on UCLAMP_TASK and CGROUP_SCHED, not FAIR_GROUP_SCHED or CFS_BANDWIDTH.
+Both options default to disabled. Existing WALT and SchedTune mechanisms remain
+available; utilization clamping does not replace their accounting.
+
+This tree also integrates WALT/SchedTune schedutil and legacy EAS consumers.
+Neutral bounds retain the old demand path. Non-neutral demand is clamped after
+IOWAIT and WALT HISPEED/NL/PL adjustments; shared policies compare independently
+clamped CPU requests. Placement and OPP selection use clamped performance demand,
+while raw load, congestion and energy busy-time accounting remain unchanged.
+UCLAMP_MAX limits utilization demand, not an exact frequency: the existing
+headroom, OPP rounding and other CPUs in a shared policy still apply.
+
+Host helper tests and object compilation do not establish bootability, device
+performance, energy savings or thermal safety. Validate the complete integration
+on the target before enabling it in a shipping configuration.
+
+Requests and effective values
+-----------------------------
+The utilization scale is [0, 1024]. Every task, including RT tasks, starts with
+requested MIN=0 and MAX=1024. There is no automatic RT minimum boost. Fork inherits
+requests but never an active runqueue reference. RESET_ON_FORK resets both requests
+to 0/1024 and clears user-defined state before the scheduling policy reset.
+
+A task has separate requested and effective clamps. Effective values are computed
+when enqueued; an active effective value identifies the bucket actually referenced
+on that runqueue. Dequeue always drops that old reference before a new request,
+CPU, scheduling class or task group is applied. Ordinary migration and hotplug
+migration use those same enqueue/dequeue paths. Sleeping tasks pick up current
+restrictions at their next enqueue.
+
+Each runqueue maintains reference-counted buckets and their local maximum. Both
+MIN and MAX are maximum-aggregated across runnable tasks: one capped task cannot
+cap another runnable task that has a higher MAX. A non-empty bucket conservatively
+retains its highest observed clamp until its last task leaves. More buckets reduce
+this bounded overboost; bucket indexes are capped for all supported counts 5..20.
+An empty runqueue drops MIN to zero and retains the last departing task's MAX to
+avoid a frequency jump caused solely by blocked utilization. Its first enqueue
+resets both values. Initial empty runqueues start with MIN=0, MAX=1024 and IDLE set.
+
+Task ABI
+--------
+The existing sched_attr member order is unchanged. VER0 is 48 bytes; VER1 appends
+u32 sched_util_min at offset 48 and u32 sched_util_max at offset 52 (56 bytes total).
+
+SCHED_FLAG_UTIL_CLAMP_MIN (0x20) and SCHED_FLAG_UTIL_CLAMP_MAX (0x40) select which
+requests to update. Unselected requests are retained. A selected ~0U value resets
+that request to its default and clears user-defined state. Validation checks the
+resulting requested range, including unselected/reset values: 0 <= MIN <= MAX <=
+1024. Invalid ranges return EINVAL. With UCLAMP_TASK disabled, selected clamp
+updates return EOPNOTSUPP. Android's CAP_SYS_NICE requirement applies to per-task
+clamp updates in addition to existing ownership/security checks.
+
+For a clamp-only update use a full 56-byte structure, sched_policy=SCHED_NORMAL
+(0), SCHED_FLAG_KEEP_ALL (KEEP_POLICY=0x08 | KEEP_PARAMS=0x10), plus the selected
+clamp flags. The task's real policy, nice/RT priority and deadline parameters are
+preserved. As in the selected upstream source, a negative sched_policy (including
+UINT_MAX) is rejected by the syscall even with KEEP_POLICY; do not use that value
+as a userspace sentinel. Unknown flags are rejected, including unsupported
+DEADLINE extensions; no previously unsupported flags silently become effective.
+
+sched_setattr accepts a 48-byte legacy structure without clamp flags; flags that
+select a clamp require 56 bytes. Oversized structures are accepted only when their
+unknown trailing bytes are zero; otherwise E2BIG reports the kernel size. Zero
+input size retains the original 48-byte compatibility interpretation.
+sched_getattr copies min(user_size, 56), reports kernel size 56 in the copied size
+member, and successfully truncates to 48 bytes even when MAX is nonzero. It never
+writes past the supplied buffer and never returns EFBIG merely because an old
+caller cannot represent a utilization-clamp field.
+
+CPU cgroups and global limits
+-----------------------------
+Non-root CPU cgroups expose cpu.uclamp.min and cpu.uclamp.max on legacy and default
+hierarchies. Values are percentages with up to two decimal places, or "max" for
+100%. Negative, malformed and out-of-range values are rejected. Requests default
+to 0%/100%; reads retain the exact requested percentage despite scale rounding.
+
+Each child's effective clamp is capped by its parent's corresponding effective
+clamp, and its effective MIN cannot exceed effective MAX. In this backported
+hierarchy model the root MIN is an allowed protection ceiling, not a task boost.
+Both task clamps are then restricted to the group's effective [MIN, MAX] interval.
+The requested cgroup range may be inverted; effective MIN is limited by MAX.
+Ancestor updates propagate to descendants, and both clamp references of runnable
+(including currently running) tasks are re-evaluated together. New groups receive
+propagated effective values before tasks can use them.
+
+/proc/sys/kernel/sched_util_clamp_min and sched_util_clamp_max set maximum allowed
+MIN/MAX requests on the 0..1024 scale. Both default to 1024 (no restriction on task
+requests); they are not default task boosts. Writes require MIN <= MAX <= 1024.
+They also update root-group ceilings and all currently runnable task references,
+including root/autogroup tasks and builds without group clamping.
+
+Lock order is uclamp_mutex -> task pi_lock -> rq lock. Hierarchy walks also hold
+RCU; task updates take task_rq_lock to serialize against enqueue/dequeue,
+migration and cgroup moves. There is no rq-lock-to-uclamp_mutex acquisition.
+
+Consumer API (kernel/sched/sched.h)
+----------------------------------
+uclamp_eff_value(p, id): effective task bound, using its active cached reference
+when present, otherwise applying current task/group/global restrictions.
+
+uclamp_rq_get(rq, id): cached runqueue bound; MAX may be retained on an idle rq.
+
+uclamp_rq_util_with(rq, util, p): apply rq bounds plus a hypothetical incoming p
+(NULL means current rq only). With p on an idle rq, ignore retained rq values.
+The incoming task has not yet been enqueued. Neutral bounds 0/1024 return util
+unchanged, even when legacy WALT/SchedTune/prediction produces util > 1024.
+
+uclamp_rq_util_without(rq, util, p): apply hypothetical source-rq bounds after
+removing p's bucket reference. The caller must first subtract p's utilization
+from util. This read-only helper scans buckets, not tasks. A shared bucket keeps
+its conservative maximum; no remaining references means neutral bounds, not the
+old idle MAX. Lockless EAS callers accept the same best-effort snapshots as other
+rq utilization reads. Actual enqueue/dequeue accounting remains under rq lock.
+
+Typical migration-energy evaluation is:
+  source = uclamp_rq_util_without(src_rq, source_util_without_p, p);
+  target = uclamp_rq_util_with(dst_rq, target_util_with_p, p);
+Clamp each CPU separately before selecting the maximum demand for a shared
+frequency policy; do not globally take the minimum of per-task MAX values.
+
+When rq bounds change, core notifies cpufreq with SCHED_CPUFREQ_UCLAMP (bit 8)
+and SCHED_CPUFREQ_WALT (needed by this vendor tree's notification wrapper).
+Consumers must invalidate cached targets and re-evaluate rate-limited decisions
+on this event. Notifications occur while rq lock is held. Disabled helpers return
+neutral bounds/original utilization and carry no task or runqueue storage.
+
+Regression checks
+-----------------
+Run from any directory:
+  python3 -I /path/to/tree/tools/testing/selftests/uclamp_core.py
+The host ASan/UBSan harness extracts actual helpers and ABI structures from this
+source tree. It exercises 5/20 bucket layouts, request validation/reset, old/new
+ABI copies, aggregation, idle transitions, fork inheritance/reset, migration,
+cgroup task restrictions and active updates. It does not execute a target kernel,
+exercise real cgroup locking, CPU hotplug or prove scheduler-device correctness.
+Independent arm64 Clang13 builds should cover UCLAMP off, task-only and task+group
+using temporary O= directories, without changing a user's defconfig.

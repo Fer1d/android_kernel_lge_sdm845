@@ -378,6 +378,11 @@ struct task_group {
 #endif
 
 	struct cfs_bandwidth cfs_bandwidth;
+#ifdef CONFIG_UCLAMP_TASK_GROUP
+	unsigned int uclamp_pct[UCLAMP_CNT];
+	struct uclamp_se uclamp_req[UCLAMP_CNT];
+	struct uclamp_se uclamp[UCLAMP_CNT];
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -707,6 +712,20 @@ extern void rto_push_irq_work_func(struct irq_work *work);
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
  */
+#ifdef CONFIG_UCLAMP_TASK
+#define UCLAMP_FLAG_IDLE 0x01
+struct uclamp_bucket {
+	unsigned int value;
+	unsigned int tasks;
+};
+
+/* Both MIN and MAX are maximum-aggregated across runnable tasks. */
+struct uclamp_rq {
+	unsigned int value;
+	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
+};
+#endif
+
 struct rq {
 	/* runqueue lock: */
 	raw_spinlock_t lock;
@@ -744,6 +763,10 @@ struct rq {
 	struct load_weight load;
 	unsigned long nr_load_updates;
 	u64 nr_switches;
+#ifdef CONFIG_UCLAMP_TASK
+	struct uclamp_rq uclamp[UCLAMP_CNT];
+	unsigned int uclamp_flags;
+#endif
 
 	struct cfs_rq cfs;
 	struct rt_rq rt;
@@ -2402,6 +2425,61 @@ static inline void cpufreq_update_this_cpu(struct rq *rq, unsigned int flags)
 static inline void cpufreq_update_util(struct rq *rq, unsigned int flags) {}
 static inline void cpufreq_update_this_cpu(struct rq *rq, unsigned int flags) {}
 #endif /* CONFIG_CPU_FREQ */
+
+/* Utilization clamping consumers: neutral clamps preserve even util > 1024. */
+static inline unsigned int uclamp_none(enum uclamp_id id)
+{
+	return id == UCLAMP_MIN ? 0 : SCHED_CAPACITY_SCALE;
+}
+
+#ifdef CONFIG_UCLAMP_TASK
+unsigned int uclamp_eff_value(struct task_struct *p, enum uclamp_id id);
+unsigned long uclamp_rq_util_without(struct rq *rq, unsigned long util,
+				  struct task_struct *p);
+static inline unsigned int uclamp_rq_get(struct rq *rq, enum uclamp_id id)
+{
+	return READ_ONCE(rq->uclamp[id].value);
+}
+static inline unsigned long uclamp_rq_util_with(struct rq *rq,
+		unsigned long util, struct task_struct *p)
+{
+	unsigned long lo = 0, hi = 0;
+
+	if (p) {
+		lo = uclamp_eff_value(p, UCLAMP_MIN);
+		hi = uclamp_eff_value(p, UCLAMP_MAX);
+		if (READ_ONCE(rq->uclamp_flags) & UCLAMP_FLAG_IDLE)
+			goto out;
+	}
+	lo = max_t(unsigned long, lo, uclamp_rq_get(rq, UCLAMP_MIN));
+	hi = max_t(unsigned long, hi, uclamp_rq_get(rq, UCLAMP_MAX));
+out:
+	if (!lo && hi == SCHED_CAPACITY_SCALE)
+		return util;
+	/* A runnable boost wins over another task's cap. */
+	return max(lo, min(util, hi));
+}
+#else
+static inline unsigned int uclamp_eff_value(struct task_struct *p,
+		enum uclamp_id id)
+{
+	return uclamp_none(id);
+}
+static inline unsigned int uclamp_rq_get(struct rq *rq, enum uclamp_id id)
+{
+	return uclamp_none(id);
+}
+static inline unsigned long uclamp_rq_util_with(struct rq *rq,
+		unsigned long util, struct task_struct *p)
+{
+	return util;
+}
+static inline unsigned long uclamp_rq_util_without(struct rq *rq,
+		unsigned long util, struct task_struct *p)
+{
+	return util;
+}
+#endif
 
 #ifdef arch_scale_freq_capacity
 #ifndef arch_scale_freq_invariant
