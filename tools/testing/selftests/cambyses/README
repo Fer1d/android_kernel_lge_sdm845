@@ -1,0 +1,34 @@
+Cambyses budget-only host selftests
+==================================
+
+Run from any directory:
+  python3 -I /home/ssx/android-kernel/tools/testing/selftests/cambyses/run.py
+
+Requires Python 3 and a host C compiler (CC, default cc) with UBSan support.
+The runner extracts actual fair.c code, compiles host-only harness binaries in
+an automatically removed temporary directory, and runs the on/off x PREEMPT
+on/off matrix. It does not build or boot a kernel.
+
+CONFIG_SCHED_CAMBYSES_BUDGET is default n and a pure compile-time switch.
+There is no runtime enable/off knob or live switching. With CONFIG=n the
+original vendor detach_tasks function is retained; source and preprocessed
+tokens are compared against baseline 97c1beea4278468ddea9f967019211c4330c6f03.
+
+The enabled experiment implements strict task_h_load budgeting and a restricted
+smallest-overshoot concession within the final scan slice only, and only before
+any successful detach in that balance. This is NOT a per-balance global minimum.
+LBF_NEED_BREAK is a pause: no concession is consumed, and references are released
+before more_balance unlocks. Earlier slices' candidates are not cached.
+Concession revalidation uses the actual migration eligibility predicate without
+repeating scan accounting or affinity-retargeting side effects. Tests extract
+both the migration predicate and detach_tasks from fair.c. Two negative controls
+reintroduce the old pause-concession and double-hot-accounting defects and must
+fail their corresponding C assertions.
+It is NOT complete Cambyses. Full/block rotation is deferred; no successor is
+cached across double_lock_balance. Tests cover budget, overshoot, vendor redo
+reset, one-concession lifetime, candidate/target validation, and a simulated
+lock-drop successor removal. Existing BORE/POC content outside the experiment
+is checked against the baseline.
+
+Host scaffolding does not reproduce real scheduler locking, WALT accounting,
+or device behavior. Passing these tests does not establish device/WALT safety.

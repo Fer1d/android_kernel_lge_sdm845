@@ -1476,6 +1476,18 @@ config SCHED_POC_SELECTOR
 	  restricted selection. WALT/EAS policy and fallback remain in charge.
 	  If unsure, say N.
 
+config SCHED_CAMBYSES_BUDGET
+	bool "Cambyses budget-only load balance experiment"
+	depends on SMP
+	default n
+	help
+	  Compile-time-only strict task_h_load budget and one smallest-overshoot
+	  concession per balance, derived from bf56abb83c89. No live switching.
+	  This is NOT complete Cambyses: block rotation is deliberately absent.
+	  The original vendor detach_tasks path is retained when disabled.
+	  Experimental; host selftests do not establish device/WALT safety.
+	  If unsure, say N.
+
 config SCHED_TUNE
 	bool "Boosting for CFS tasks (EXPERIMENTAL)"
 	depends on SMP

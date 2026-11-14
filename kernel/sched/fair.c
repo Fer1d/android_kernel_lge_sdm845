@@ -8615,6 +8615,131 @@ static inline int migrate_degrades_locality(struct task_struct *p,
 /*
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
  */
+#ifdef CONFIG_SCHED_CAMBYSES_BUDGET
+/* Revalidation uses identical eligibility without scan accounting/retargeting. */
+static
+int can_migrate_task_check(struct task_struct *p, struct lb_env *env,
+			   bool account)
+{
+	int tsk_cache_hot;
+
+	lockdep_assert_held(&env->src_rq->lock);
+
+	/*
+	 * We do not migrate tasks that are:
+	 * 1) throttled_lb_pair, or
+	 * 2) cannot be migrated to this CPU due to cpus_allowed, or
+	 * 3) running (obviously), or
+	 * 4) are cache-hot on their current CPU.
+	 */
+	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
+		return 0;
+
+	if (!cpumask_test_cpu(env->dst_cpu, tsk_cpus_allowed(p))) {
+		int cpu;
+
+		if (account)
+			schedstat_inc(p->se.statistics.nr_failed_migrations_affine);
+
+		if (account)
+			env->flags |= LBF_SOME_PINNED;
+
+		/*
+		 * Remember if this task can be migrated to any other cpu in
+		 * our sched_group. We may want to revisit it if we couldn't
+		 * meet load balance goals by pulling other tasks on src_cpu.
+		 *
+		 * Also avoid computing new_dst_cpu if we have already computed
+		 * one in current iteration.
+		 */
+		if (!account || !env->dst_grpmask || (env->flags & LBF_DST_PINNED))
+			return 0;
+
+		/* Prevent to re-select dst_cpu via env's cpus */
+		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
+			if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p))) {
+				env->flags |= LBF_DST_PINNED;
+				env->new_dst_cpu = cpu;
+				break;
+			}
+		}
+
+		return 0;
+	}
+
+	/* Record that we found atleast one task that could run on dst_cpu */
+	if (account)
+		env->flags &= ~LBF_ALL_PINNED;
+
+	if (energy_aware() && !env->dst_rq->rd->overutilized &&
+	    env->idle == CPU_NEWLY_IDLE &&
+	    !task_in_related_thread_group(p)) {
+		long util_cum_dst, util_cum_src;
+		unsigned long demand;
+
+		demand = task_util(p);
+		util_cum_dst = cpu_util_cum(env->dst_cpu, 0) + demand;
+		util_cum_src = cpu_util_cum(env->src_cpu, 0) - demand;
+
+		if (util_cum_dst > util_cum_src)
+			return 0;
+	}
+
+#ifdef CONFIG_SCHED_WALT
+	if (env->flags & LBF_IGNORE_PREFERRED_CLUSTER_TASKS &&
+			 !preferred_cluster(cpu_rq(env->dst_cpu)->cluster, p))
+		return 0;
+
+	/* Don't detach task if it doesn't fit on the destination */
+	if (env->flags & LBF_IGNORE_BIG_TASKS &&
+		!task_fits_max(p, env->dst_cpu))
+		return 0;
+#endif
+
+	/* Dont allow boosted tasks to be pulled to small cores unless
+	 * big cores are overutilized
+	 */
+	if (!env->src_rq->rd->overutilized &&
+		env->flags & LBF_IGNORE_BIG_TASKS &&
+		(schedtune_task_boost(p) > 0))
+		return 0;
+
+	if (task_running(env->src_rq, p)) {
+		if (account)
+			schedstat_inc(p->se.statistics.nr_failed_migrations_running);
+		return 0;
+	}
+
+	/*
+	 * Aggressive migration if:
+	 * 1) IDLE or NEWLY_IDLE balance.
+	 * 2) destination numa is preferred
+	 * 3) task is cache cold, or
+	 * 4) too many balance attempts have failed.
+	 */
+	tsk_cache_hot = migrate_degrades_locality(p, env);
+	if (tsk_cache_hot == -1)
+		tsk_cache_hot = task_hot(p, env);
+
+	if (env->idle != CPU_NOT_IDLE || tsk_cache_hot <= 0 ||
+	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
+		if (account && tsk_cache_hot == 1) {
+			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
+			schedstat_inc(p->se.statistics.nr_forced_migrations);
+		}
+		return 1;
+	}
+
+	if (account)
+		schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
+	return 0;
+}
+
+static int can_migrate_task(struct task_struct *p, struct lb_env *env)
+{
+	return can_migrate_task_check(p, env, true);
+}
+#else /* original migration predicate */
 static
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
@@ -8726,6 +8851,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	schedstat_inc(p->se.statistics.nr_failed_migrations_hot);
 	return 0;
 }
+#endif /* migration predicate */
 
 /*
  * detach_task() -- detach the task for the migration specified in env
@@ -8781,6 +8907,194 @@ static const unsigned int sched_nr_migrate_break = 32;
  *
  * Returns number of detached tasks if successful and 0 otherwise.
  */
+#ifdef CONFIG_SCHED_CAMBYSES_BUDGET
+/* Sticky for the entire load_balance() env, including more_balance/redo. */
+#define LBF_CAMBYSES_MOVED 0x20
+
+struct lb_concession {
+	struct task_struct *p;
+	unsigned long cost;
+};
+
+static void lb_concession_clear(struct lb_concession *c)
+{
+	if (c->p)
+		put_task_struct(c->p);
+	c->p = NULL;
+	c->cost = 0;
+}
+
+static bool lb_cost_fits(struct lb_env *env, struct lb_concession *c,
+			 struct task_struct *p, unsigned long cost)
+{
+	if (cost <= (unsigned long)env->imbalance)
+		return true;
+
+	if (!(env->flags & LBF_CAMBYSES_MOVED) &&
+	    (!c->p || cost < c->cost)) {
+		lb_concession_clear(c);
+		get_task_struct(p);
+		c->p = p;
+		c->cost = cost;
+	}
+	return false;
+}
+
+/* Called with src_rq locked, before any detach can drop that lock. */
+static bool lb_concession_valid(struct task_struct *p, struct lb_env *env)
+{
+	return env->src_rq == cpu_rq(env->src_cpu) &&
+		env->dst_rq == cpu_rq(env->dst_cpu) &&
+		env->src_cpu != env->dst_cpu && cpu_active(env->dst_cpu) &&
+		!cpu_isolated(env->dst_cpu) &&
+		task_on_rq_queued(p) && task_cpu(p) == env->src_cpu &&
+		task_rq(p) == env->src_rq && p->sched_class == &fair_sched_class &&
+		!task_running(env->src_rq, p) &&
+		can_migrate_task_check(p, env, false);
+}
+
+static int detach_tasks(struct lb_env *env)
+{
+	struct list_head *tasks = &env->src_rq->cfs_tasks;
+	struct lb_concession concession = { NULL, 0 };
+	struct task_struct *p;
+	unsigned long load;
+	int detached = 0;
+	int orig_loop = env->loop;
+
+	lockdep_assert_held(&env->src_rq->lock);
+
+	if (env->imbalance <= 0)
+		return 0;
+
+	if (!same_cluster(env->dst_cpu, env->src_cpu))
+		env->flags |= LBF_IGNORE_PREFERRED_CLUSTER_TASKS;
+
+	if (cpu_capacity(env->dst_cpu) < cpu_capacity(env->src_cpu))
+		env->flags |= LBF_IGNORE_BIG_TASKS;
+
+redo:
+	/* No candidate survives vendor redo or any source-lock release. */
+	lb_concession_clear(&concession);
+	while (!list_empty(tasks)) {
+		/*
+		 * We don't want to steal all, otherwise we may be treated likewise,
+		 * which could at worst lead to a livelock crash.
+		 */
+		if (env->idle != CPU_NOT_IDLE && env->src_rq->nr_running <= 1)
+			break;
+
+		p = list_first_entry(tasks, struct task_struct, se.group_node);
+
+		env->loop++;
+		/* We've more or less seen every task there is, call it quits */
+		if (env->loop > env->loop_max)
+			break;
+
+		/* take a breather every nr_migrate tasks */
+		if (env->loop > env->loop_break) {
+			env->loop_break += sched_nr_migrate_break;
+			env->flags |= LBF_NEED_BREAK;
+			break;
+		}
+
+		if (!can_migrate_task(p, env))
+			goto next;
+
+		/*
+		 * Depending of the number of CPUs and tasks and the
+		 * cgroup hierarchy, task_h_load() can return a null
+		 * value. Make sure that env->imbalance decreases
+		 * otherwise detach_tasks() will stop only after
+		 * detaching up to loop_max tasks.
+		 */
+		load = max_t(unsigned long, task_h_load(p), 1);
+
+
+		if (sched_feat(LB_MIN) && load < 16 && !env->sd->nr_balance_failed)
+			goto next;
+
+		/* Strict even for two-task queues; concession is the only escape. */
+		if (!lb_cost_fits(env, &concession, p, load))
+			goto next;
+
+		/* detach_task may drop src_rq in double_lock_balance(). */
+		lb_concession_clear(&concession);
+		env->flags |= LBF_CAMBYSES_MOVED;
+
+		detach_task(p, env);
+		list_add(&p->se.group_node, &env->tasks);
+
+		detached++;
+		env->imbalance -= load;
+
+#ifdef CONFIG_PREEMPT
+		/*
+		 * NEWIDLE balancing is a source of latency, so preemptible
+		 * kernels will stop after the first task is detached to minimize
+		 * the critical section.
+		 */
+		if (env->idle == CPU_NEWLY_IDLE)
+			break;
+#endif
+
+		/*
+		 * We only want to steal up to the prescribed amount of
+		 * weighted load.
+		 */
+		if (env->imbalance <= 0)
+			break;
+
+		continue;
+next:
+		list_move_tail(&p->se.group_node, tasks);
+	}
+
+	if (env->flags & (LBF_IGNORE_BIG_TASKS |
+			LBF_IGNORE_PREFERRED_CLUSTER_TASKS) && !detached) {
+		tasks = &env->src_rq->cfs_tasks;
+		env->flags &= ~(LBF_IGNORE_BIG_TASKS |
+				LBF_IGNORE_PREFERRED_CLUSTER_TASKS);
+		env->loop = orig_loop;
+		goto redo;
+	}
+
+	/* Only the final slice may concede: never claim a balance-global minimum.
+	 * A NEED_BREAK pause discards references before more_balance unlocks.
+	 */
+	if (!detached && !(env->flags & (LBF_CAMBYSES_MOVED | LBF_NEED_BREAK)) &&
+	    env->imbalance > 0 && concession.p &&
+	    (env->idle == CPU_NOT_IDLE || env->src_rq->nr_running > 1)) {
+		p = concession.p;
+		if (lb_concession_valid(p, env)) {
+			/* Recompute cost and LB_MIN after revalidating the target. */
+			load = max_t(unsigned long, task_h_load(p), 1);
+			if (!(sched_feat(LB_MIN) && load < 16 &&
+			      !env->sd->nr_balance_failed)) {
+				lb_concession_clear(&concession);
+				env->flags |= LBF_CAMBYSES_MOVED;
+				detach_task(p, env);
+				list_add(&p->se.group_node, &env->tasks);
+				detached++;
+				/* Saturate: unsigned cost may exceed LONG_MAX. */
+				env->imbalance = load >= (unsigned long)env->imbalance ?
+					0 : env->imbalance - load;
+			}
+		}
+	}
+	lb_concession_clear(&concession);
+
+	/*
+	 * Right now, this is one of only two places we collect this stat
+	 * so we can safely collect detach_one_task() stats here rather
+	 * than inside detach_one_task().
+	 */
+	schedstat_add(env->sd->lb_gained[env->idle], detached);
+
+	return detached;
+}
+
+#else /* original vendor path, token-for-token unchanged */
 static int detach_tasks(struct lb_env *env)
 {
 	struct list_head *tasks = &env->src_rq->cfs_tasks;
@@ -8898,6 +9212,8 @@ next:
 
 	return detached;
 }
+
+#endif /* CONFIG_SCHED_CAMBYSES_BUDGET */
 
 /*
  * attach_task() -- attach the task detached by detach_task() to its new rq.
