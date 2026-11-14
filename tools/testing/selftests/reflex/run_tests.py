@@ -104,17 +104,20 @@ stop=fn(s,'rfx_stop');assert stop.index('cpufreq_remove_update_util_hook')<stop.
 start=fn(s,'rfx_start');assert start.index('memset')<start.index('cpufreq_add_update_util_hook')
 init=fn(s,'rfx_init');assert 'kobject_put(&tunables->attr_set.kobj)' in init and 'policy->governor_data = NULL' in init and 'cpufreq_disable_fast_switch(policy)' in init
 assert 'MAX_USER_RT_PRIO / 2' in fn(s,'rfx_kthread_create')
-assert 'linux/energy_model.h' not in s and 'CONFIG_CPU_FREQ_DEFAULT_GOV_REFLEX' not in s
+assert 'linux/energy_model.h' not in s
 k=(w/'drivers/cpufreq/Kconfig').read_text()
 reflex=k[k.index('config CPU_FREQ_GOV_REFLEX'):k.index('if CPU_FREQ_GOV_SCHEDUTIL')]
 assert '\tbool ' in reflex and '\tdefault n' in reflex
-assert 'CPU_FREQ_DEFAULT_GOV_REFLEX' not in k
+assert 'config CPU_FREQ_DEFAULT_GOV_REFLEX\n' in k
 baseline=subprocess.run(['git','-C',str(w),'show','97c1beea4278:kernel/sched/cpufreq_schedutil.c'],capture_output=True,text=True)
 if baseline.returncode == 0:
  assert h.split('\n#ifdef CONFIG_CPU_FREQ_GOV_REFLEX')[0].replace('#include <linux/math64.h>\n#include <linux/sched/cpufreq.h>\n','').rstrip()==baseline.stdout.rstrip()
  basek=subprocess.check_output(['git','-C',str(w),'show','97c1beea4278:drivers/cpufreq/Kconfig'],text=True)
- assert k[:k.index('endchoice')]==basek[:basek.index('endchoice')]
- print('PASS historical schedutil body and default choice unchanged')
+ added=k[k.index('config CPU_FREQ_DEFAULT_GOV_REFLEX'):k.index('endchoice')]
+ assert k[:k.index('endchoice')].replace(added,'')==basek[:basek.index('endchoice')]
+ print('PASS historical schedutil body and existing default choices unchanged')
 else:
  print('SKIP historical baseline comparison: base object unavailable (exported/shallow tree)')
-print('PASS static lifecycle ordering/init rollback/FIFO50; bool/default n/no Reflex default choice')
+print('PASS static lifecycle ordering/init rollback/FIFO50; bool/default n/Reflex default choice')
+subprocess.run(['python3','-I',str(Path(__file__).with_name('default_tests.py')),
+                '--src',str(w),'--out',str(out)],check=True)

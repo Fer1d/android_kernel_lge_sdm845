@@ -51,6 +51,10 @@ core += ''.join(function(elevator, f) for f in (
     'elevator_change', 'elv_dispatch_add_tail'))
 kconfig = (ROOT / 'block/Kconfig.iosched').read_text()
 assert re.search(r'config IOSCHED_ADIOS\n\tbool [^\n]+\n\tdefault n\n', kconfig)
+assert re.search(r'config DEFAULT_ADIOS\n\s+bool "ADIOS" if IOSCHED_ADIOS=y', kconfig)
+assert '\tdefault "adios" if DEFAULT_ADIOS\n' in kconfig
+assert 'config DEFAULT_ANXIETY\n' in kconfig
+assert '\tdefault "anxiety" if DEFAULT_ANXIETY\n' in kconfig
 assert 'REQ_OP_WRITE_SAME' in (ROOT / 'include/linux/blk_types.h').read_text()
 with tempfile.TemporaryDirectory(prefix='adios-host-') as tmp:
     tmp = Path(tmp)

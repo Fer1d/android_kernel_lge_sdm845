@@ -989,7 +989,22 @@ static void __exit reflex_gov_exit(void)
 	cpufreq_unregister_governor(&reflex_gov);
 }
 
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_REFLEX
+struct cpufreq_governor *cpufreq_default_governor(void)
+{
+	return &reflex_gov;
+}
+
+/*
+ * Qualcomm can create policies from subsys_initcall(msm_cpufreq_register),
+ * before fs_initcall. Register first, after cpufreq_core_init (core_initcall).
+ * This only registers the governor; policy init creates the slow-path worker
+ * later, with kthreadd and workqueues already available.
+ */
+postcore_initcall(reflex_gov_init);
+#else
 module_init(reflex_gov_init);
+#endif
 module_exit(reflex_gov_exit);
 
 MODULE_AUTHOR(CPUFREQ_REFLEX_AUTHOR);

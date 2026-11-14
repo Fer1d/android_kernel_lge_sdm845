@@ -23,8 +23,12 @@ the source directory. Negative tests modify temporary copies only.
 Port scope
 ----------
 CONFIG_CPU_FREQ_GOV_REFLEX is bool, default n, with schedutil required.
-It does not introduce a Reflex default-governor choice or change the actual
-runtime governor. This adaptation uses cube-law floors only: it is not a
+Enabling it alone does not change the runtime governor. The optional
+CPU_FREQ_DEFAULT_GOV_REFLEX choice depends on SMP (inside CPU_FREQ), selects
+CPU_FREQ_GOV_REFLEX, CPU_FREQ_GOV_SCHEDUTIL and CPU_FREQ_GOV_PERFORMANCE as
+built-ins, and supplies the sole strong cpufreq_default_governor() provider.
+No defconfig is changed by these selftests or this default-choice addition.
+This adaptation uses cube-law floors only: it is not a
 modern Energy Model, CPPC or adjust_perf backport. The worker follows the
 local schedutil FIFO50 and related_cpus binding rather than source FIFO99.
 
@@ -39,9 +43,39 @@ Coverage and limitations
 run_tests.py extracts production functions and checks 49,572 clamp cases,
 shared capacity normalization, floors, force/rate/cache, PELT decay, cube
 root, WALT/PELT notification compilation, and static lifecycle ordering.
-The historical schedutil/default-choice comparison uses base 97c1beea4278
-when that git object exists; exported/shallow trees explicitly SKIP only
-that comparison. Structural bool/default-n/lifecycle assertions still run.
+The historical schedutil/existing-default-choices comparison uses base
+97c1beea4278 when that git object exists; exported/shallow trees explicitly
+SKIP only that comparison. Structural bool/default-n/lifecycle assertions
+still run. run_tests.py also runs default_tests.py, which can run separately
+with the same --src/--out options. It builds only the host Kconfig parser
+from the shipped sources, resolves the actual block/cpufreq Kconfigs, checks
+ADIOS's derived default string, Anxiety alternative, Reflex selected helper
+and fallback dependencies, SMP/CPU_FREQ/ADIOS false combinations and the
+non-default opt-in case. It preprocesses all eight actual default providers
+and host-links each singleton strong provider against the actual weak-core
+provider. This is not a full translation-unit or kernel link test.
+
+Initialization order and failure semantics
+------------------------------------------
+Default Reflex registers at postcore_initcall (2), after cpufreq core's
+core_initcall (1) and before Qualcomm's subsys_initcall (4), which can probe
+and create policies immediately. fs_initcall (5), used by the seven existing
+default governors, would be too late for that path; those governors are not
+modified here. Non-default Reflex retains module_init (6). The initcall
+only registers the governor; it does not allocate a policy or start workers.
+kthreadd and workqueue initialization precede initcalls, so the later
+policy init may safely create a slow worker. Existing worker failure paths
+and FIFO50/related_cpus affinity are unchanged; review_tests.py exercises
+creation and scheduler failures, not live early-boot concurrency.
+
+Registration errors propagate from cpufreq_register_governor; policy init
+errors unwind resources and propagate to the core, without automatic retry
+on schedutil or performance. Schedutil is a manual alternative/helper, not
+an automatic failure fallback. The built-in performance fallback provider
+is available directly even before its fs_initcall list registration, but
+the core only uses it for max_transition_latency rejection. Reflex currently
+has no max_transition_latency, so allocation/worker/sysfs failures do not
+trigger that fallback. Device/kernel validation remains a release gate.
 
 review_tests.py executes extracted actual single/shared callback bodies,
 worker execution and worker creation, using host stand-ins only for APIs

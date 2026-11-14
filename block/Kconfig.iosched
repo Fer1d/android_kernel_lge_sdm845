@@ -58,7 +58,8 @@ config IOSCHED_ADIOS
 	  no latency prediction or deadline enforcement is implemented.
 	  Host API-mock tests do not establish in-kernel/device correctness.
 	  Keep disabled unless explicitly evaluating this isolated candidate.
-	  Enabling this does not change the default I/O scheduler.
+	  Enabling this alone does not change the default I/O scheduler;
+	  select ADIOS in the default scheduler choice to use it at boot.
 	  Built-in only: this tree's elevator_init and elevator_switch have
 	  inconsistent module-reference ownership on init failure. The private
 	  allocation order avoids init double-put, but cannot fix switch's
@@ -83,6 +84,9 @@ choice
 	config DEFAULT_ANXIETY
 		bool "Anxiety" if IOSCHED_ANXIETY=y
 
+	config DEFAULT_ADIOS
+		bool "ADIOS" if IOSCHED_ADIOS=y
+
 endchoice
 
 config DEFAULT_IOSCHED
@@ -91,6 +95,7 @@ config DEFAULT_IOSCHED
 	default "cfq" if DEFAULT_CFQ
 	default "noop" if DEFAULT_NOOP
 	default "anxiety" if DEFAULT_ANXIETY
+	default "adios" if DEFAULT_ADIOS
 
 endmenu
 
