@@ -48,6 +48,22 @@ config CFQ_GROUP_IOSCHED
 	---help---
 	  Enable group IO scheduling in CFQ.
 
+config IOSCHED_ADIOS
+	bool "ADIOS-derived FIFO/batch candidate (experimental)"
+	default n
+	---help---
+	  Optional legacy single-queue FIFO scheduler with bounded per-operation
+	  round-robin batches, derived from the Baka ADIOS 4.9 port.
+	  This is NOT the complete ADIOS 3.3 adaptive/deadline algorithm:
+	  no latency prediction or deadline enforcement is implemented.
+	  Host API-mock tests do not establish in-kernel/device correctness.
+	  Keep disabled unless explicitly evaluating this isolated candidate.
+	  Enabling this does not change the default I/O scheduler.
+	  Built-in only: this tree's elevator_init and elevator_switch have
+	  inconsistent module-reference ownership on init failure. The private
+	  allocation order avoids init double-put, but cannot fix switch's
+	  missing put without changing the core. Module support is not offered.
+
 choice
 	prompt "Default I/O scheduler"
 	default DEFAULT_CFQ
