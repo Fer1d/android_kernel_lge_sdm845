@@ -1,0 +1,102 @@
+UFS synchronous-init host regression tests
+========================================
+
+Run without a kernel build or device. Python 3, a C11 host compiler, and git
+(or an explicitly supplied fixed-baseline source export) are required.
+
+  make -C /home/ssx/android-kernel/tools/testing/selftests/ufs run_tests \
+    SRC=/home/ssx/android-kernel \
+    OUT=/mnt/e/LG/ufs-release-gate-re61k1hh/selftests/normal HOSTCC=cc
+
+  make -C /home/ssx/android-kernel/tools/testing/selftests/ufs run_tests \
+    SRC=/home/ssx/android-kernel \
+    OUT=/mnt/e/LG/ufs-release-gate-re61k1hh/selftests/sanitized \
+    HOSTCC=cc SANITIZE=1
+
+Equivalent direct invocation (supports isolated Python):
+
+  python3 -I /home/ssx/android-kernel/tools/testing/selftests/ufs/test_sync_init.py \
+    --src /home/ssx/android-kernel --out /absolute/external/output --hostcc cc
+
+Both --src and --out are mandatory. Output must be outside the source tree.
+HOSTCC can include compiler arguments. No candidate path, temporary directory,
+HEAD baseline, patch generation, source modification, fetch, or device access
+is built into the runner. Make propagates Python, extraction, compiler,
+assertion, and sanitizer failures. Sanitizer mode enables ASan+UBSan and makes
+both fatal, with non-PIE host executables for reliable ASan shadow placement.
+
+What actually executes
+----------------------
+Each run reads the selected current working-tree source, lexically masks C
+comments/strings for brace matching, and fails on missing/ambiguous function
+or slice boundaries. It writes generated C, host binaries, and an extraction
+SHA-256 manifest only under OUT. Shim fixtures contain stubs and assertions;
+the tested production bodies are inserted at ACTUAL_SOURCE, not reimplemented
+as a Python lifecycle model. Reference transformation scripts are never run.
+
+* lifecycle: complete queue_recovery, init_handoff, scan_handoff, hold_all;
+  512 event/fatal combinations, sticky INIT failure even after error fields
+  clear, LIVE EH preservation, independent scan handoff and hold unwind.
+* scan: complete async_scan/card_detect_handler and handoff/recovery functions;
+  deterministic actual EH queue insertion at the probe-return boundary, with
+  EH and PM flags both set, tests caller-owned readiness on success/failure;
+  also tests async hold failure. Probe itself is a stub. These cases DO NOT
+  assert PM balance under arbitrary EH/PM interleavings: existing real probe
+  PM puts depend on !EH && !pm_op_in_progress. This suite claims handoff
+  independence only, not that concurrent probe PM behavior was changed.
+* hibern8: three complete enter/exit functions; 12 enter + 12 exit executions,
+  INIT/STOPPING errors and LINERESET, and existing LIVE BUG policy. BUG is
+  counted rather than crashing the host. Link recovery and UIC are stubs.
+* tm: ONLY the real acquisition/hold/failure-unwind prefix of issue_tm_cmd,
+  through the first host_lock acquisition. Successful completion is stubbed;
+  no claim to test TM descriptors, interrupts, timeout, or command execution.
+* pm: real init suffix from IRQ registration to the final return, including
+  all original failure labels, plus COMPLETE platform and PCI probe callers.
+  Earlier init setup and hardware operations are stubbed. 75 cases cover
+  platform PM-disabled normal probe, PCI core's preexisting reference, !PM,
+  request-IRQ/scsi-add/enable/workqueue failures, and INIT EH injection during
+  IRQ registration, HBA enable, PM get, and command-log init. Checks sticky
+  failure, publication order, usage balance, IRQ synchronization/free before
+  cancellation, and no publication on failure. PM-disabled get_sync returns
+  -EACCES, !PM get_sync returns -ENOSYS, enabled get_sync returns +1; noresume
+  takes a reference without resuming. These are explicit host PM contracts,
+  NOT executions of Linux PM core. Async scan completion is modeled by one
+  final put only in the successful PM test; full probe_hba is not executed.
+
+The source-order check additionally requires EH work initialization before
+request_irq, enable, handoff, and async publication, and no synchronous goto
+after the LIVE commit. This is a structural assertion, not runtime coverage
+of the omitted init prefix. No test substitutes for kernel/device validation.
+
+Fixed normal-remove baseline and shallow repositories
+----------------------------------------------------
+Normal ufshcd_remove is compared byte-for-byte against the immutable commit
+42758fbbe770918f9c654e78791e3893fa7dbef4, never against the tree's own HEAD.
+The short form 42758 is ambiguous in this repository. The git object exists
+in the validated shallow tree. If absent elsewhere, the test FAILS and never
+fetches. Export drivers/scsi/ufs/ufshcd.c from that exact commit in a trusted
+repository, transfer it, and supply BASELINE_SOURCE=/absolute/export to make
+(or --baseline-source to Python). The caller is responsible for provenance
+of such an export; the test cannot independently authenticate an arbitrary
+file. It still compares the actual remove function.
+
+Validated results
+-----------------
+Logs and generated C are under
+/mnt/e/LG/ufs-release-gate-re61k1hh/selftests.
+normal.log and sanitized.log: all five suites pass against final current
+source after the separate init get_sync -> get_noresume fix.
+negative-old.log: unmodified 7bf7d707f915 source fails the PM-disabled normal
+platform probe success assertion, after the other four suites pass; make=2.
+negative-hostcc.log: HOSTCC=false fails, make=2.
+negative-extraction.log: nonexistent source fails, make=2.
+negative-missing-function.log: a separate external fixture with the handoff
+function definition renamed fails actual-function extraction, make=2.
+negative-missing-args.log: missing SRC/OUT fails, make=2.
+pre-pm.log is an earlier development compile log, not a release result.
+
+To reproduce the old-source negative control without changing the worktree,
+export the three drivers/scsi/ufs/{ufshcd,ufshcd-pltfrm,ufshcd-pci}.c files from
+7bf7d707f915 into a new external directory preserving their paths. Invoke
+make with SRC pointing there, an independent OUT, and BASELINE_SOURCE set to
+the trusted fixed-baseline export above. The expected outcome is nonzero.
