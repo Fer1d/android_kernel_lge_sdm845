@@ -256,6 +256,16 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_REFLEX
+	bool "'reflex' experimental cpufreq policy governor"
+	depends on CPU_FREQ && SMP && CPU_FREQ_GOV_SCHEDUTIL
+	select IRQ_WORK
+	default n
+	help
+	  Optional measured-demand governor derived from Reflex v0.4.0.
+	  Uses a cube-law approximation only, not the modern Energy Model.
+	  Does not change the default governor. If in doubt, say N.
+
 if CPU_FREQ_GOV_SCHEDUTIL
 
 config SCHEDUTIL_UP_RATE_LIMIT_BIG

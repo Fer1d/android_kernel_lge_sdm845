@@ -1,0 +1,64 @@
+Reflex host selftests
+====================
+
+Requirements: Python 3, a host C compiler named cc, and its AddressSanitizer
+and UndefinedBehaviorSanitizer runtimes. These scripts compile host C only;
+they do not build a kernel, change a governor, or access a device.
+
+Run from any working directory:
+
+  python3 -I /path/to/repo/tools/testing/selftests/reflex/run_tests.py
+  python3 -I /path/to/repo/tools/testing/selftests/reflex/review_tests.py
+  python3 -I /path/to/repo/tools/testing/selftests/reflex/negative_tests.py
+
+Each accepts --src /path/to/kernel and --out /path/to/output-parent.
+The default source is Path(__file__).resolve().parents[4]. Generated C,
+executables and mutation logs go into a unique tempfile directory (printed
+at startup), under --out if supplied, otherwise the system temporary area.
+Artifacts are retained for inspection; remove that printed directory when
+done. --out inside the selected source tree is rejected. Python isolated
+mode avoids local import interference. No generated file is written into
+the source directory. Negative tests modify temporary copies only.
+
+Port scope
+----------
+CONFIG_CPU_FREQ_GOV_REFLEX is bool, default n, with schedutil required.
+It does not introduce a Reflex default-governor choice or change the actual
+runtime governor. This adaptation uses cube-law floors only: it is not a
+modern Energy Model, CPPC or adjust_perf backport. The worker follows the
+local schedutil FIFO50 and related_cpus binding rather than source FIFO99.
+
+Uclamp bounds apply to base utilization, measured H envelope, IO boost and
+speed floors, with local MIN-wins conflict semantics. Shared policies form
+per-CPU candidates before taking the maximum; one CPU's cap is not a policy
+cap. UCLAMP notifications bypass the WALT gate and force rate/cache
+recalculation. Neutral input retains boosted_cpu_util/WALT sourcing.
+
+Coverage and limitations
+------------------------
+run_tests.py extracts production functions and checks 49,572 clamp cases,
+shared capacity normalization, floors, force/rate/cache, PELT decay, cube
+root, WALT/PELT notification compilation, and static lifecycle ordering.
+The historical schedutil/default-choice comparison uses base 97c1beea4278
+when that git object exists; exported/shallow trees explicitly SKIP only
+that comparison. Structural bool/default-n/lifecycle assertions still run.
+
+review_tests.py executes extracted actual single/shared callback bodies,
+worker execution and worker creation, using host stand-ins only for APIs
+that exist locally. It rejects the missing remote-DVFS helper/field rather
+than fabricating them. Cases include actual versus requested frequency,
+CPUFREQ_ENTRY_INVALID preserving cur, in/out-of-policy callers, forced
+updates, slow work, FIFO50, affinity and creation/scheduler failures.
+
+negative_tests.py requires seven injected regressions to fail, including
+both dropped fast-switch return values, failed-cur overwrite, wrong worker
+mask, remote fast caller admission, and missing helper/field. It checks
+that state mutations fail by assertion, not incidental compiler failure.
+
+Host stand-ins are not the kernel scheduler, driver, cpumask implementation,
+RCU, irq_work or sysfs. Passing tests do not establish ABI/link correctness,
+race freedom, hotplug safety, hardware frequency behavior or energy savings.
+Init/stop/limits/sysfs lifecycle checks are static, not live concurrency or
+fault-injection validation. OPP rounding and policy minimum may exceed a
+logical utilization-clamp frequency request. Kernel and device validation
+remain separate release gates.

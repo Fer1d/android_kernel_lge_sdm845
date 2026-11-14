@@ -2415,7 +2415,8 @@ static inline void cpufreq_update_util(struct rq *rq, unsigned int flags)
 	u64 clock;
 
 #ifdef CONFIG_SCHED_WALT
-	if (!(flags & SCHED_CPUFREQ_WALT))
+	if (!walt_disabled && sysctl_sched_use_walt_cpu_util &&
+	    !(flags & (SCHED_CPUFREQ_WALT | SCHED_CPUFREQ_UCLAMP)))
 		return;
 	clock = sched_ktime_clock();
 #else
