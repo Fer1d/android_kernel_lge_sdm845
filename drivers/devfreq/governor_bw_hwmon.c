@@ -85,6 +85,8 @@ static LIST_HEAD(hwmon_list);
 static DEFINE_MUTEX(list_lock);
 
 static int use_cnt;
+/* Registration may synchronously invoke an event under state_lock. */
+static DEFINE_MUTEX(register_lock);
 static DEFINE_MUTEX(state_lock);
 
 #define show_attr(name) \
@@ -618,7 +620,8 @@ static int gov_start(struct devfreq *df)
 	node->orig_data = df->data;
 	df->data = node;
 
-	if (start_monitor(df, true))
+	ret = start_monitor(df, true);
+	if (ret)
 		goto err_start;
 
 	ret = sysfs_create_group(&df->dev.kobj, node->attr_grp);
@@ -945,16 +948,21 @@ int register_bw_hwmon(struct device *dev, struct bw_hwmon *hwmon)
 	list_add_tail(&node->list, &hwmon_list);
 	mutex_unlock(&list_lock);
 
+	mutex_lock(&register_lock);
 	if (hwmon->gov) {
 		ret = devfreq_add_governor(hwmon->gov);
 	} else {
-		mutex_lock(&state_lock);
 		if (!use_cnt)
 			ret = devfreq_add_governor(&devfreq_gov_bw_hwmon);
 		if (!ret)
 			use_cnt++;
-		mutex_unlock(&state_lock);
 	}
+	if (ret) {
+		mutex_lock(&list_lock);
+		list_del_init(&node->list);
+		mutex_unlock(&list_lock);
+	}
+	mutex_unlock(&register_lock);
 
 	if (!ret)
 		dev_info(dev, "BW HWmon governor registered.\n");

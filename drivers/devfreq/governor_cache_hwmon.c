@@ -400,6 +400,11 @@ int register_cache_hwmon(struct device *dev, struct cache_hwmon *hwmon)
 	node->hw = hwmon;
 	node->attr_grp = &dev_attr_group;
 
+	/* A newly registered governor can synchronously START this node. */
+	mutex_lock(&list_lock);
+	list_add_tail(&node->list, &cache_hwmon_list);
+	mutex_unlock(&list_lock);
+
 	mutex_lock(&register_lock);
 	if (!use_cnt) {
 		ret = devfreq_add_governor(&devfreq_cache_hwmon);
@@ -412,12 +417,11 @@ int register_cache_hwmon(struct device *dev, struct cache_hwmon *hwmon)
 		dev_info(dev, "Cache HWmon governor registered.\n");
 	} else {
 		dev_err(dev, "Failed to add Cache HWmon governor\n");
+		mutex_lock(&list_lock);
+		list_del_init(&node->list);
+		mutex_unlock(&list_lock);
 		return ret;
 	}
-
-	mutex_lock(&list_lock);
-	list_add_tail(&node->list, &cache_hwmon_list);
-	mutex_unlock(&list_lock);
 
 	return ret;
 }

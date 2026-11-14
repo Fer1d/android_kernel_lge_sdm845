@@ -194,7 +194,8 @@ static int gov_start(struct devfreq *df)
 	node->orig_data = df->data;
 	df->data = node;
 
-	if (start_monitor(df))
+	ret = start_monitor(df);
+	if (ret)
 		goto err_start;
 
 	ret = sysfs_create_group(&df->dev.kobj, node->attr_grp);
@@ -417,10 +418,7 @@ static struct memlat_node *register_common(struct device *dev,
 		return ERR_PTR(-EINVAL);
 	}
 
-	mutex_lock(&list_lock);
-	list_add_tail(&node->list, &memlat_list);
-	mutex_unlock(&list_lock);
-
+	/* Publish only after the caller has selected gov and attr_grp. */
 	return node;
 }
 
@@ -438,11 +436,19 @@ int register_compute(struct device *dev, struct memlat_hwmon *hw)
 	mutex_lock(&state_lock);
 	node->gov = &devfreq_gov_compute;
 	node->attr_grp = &compute_dev_attr_group;
+	mutex_lock(&list_lock);
+	list_add_tail(&node->list, &memlat_list);
+	mutex_unlock(&list_lock);
 
 	if (!compute_use_cnt)
 		ret = devfreq_add_governor(&devfreq_gov_compute);
 	if (!ret)
 		compute_use_cnt++;
+	else {
+		mutex_lock(&list_lock);
+		list_del_init(&node->list);
+		mutex_unlock(&list_lock);
+	}
 	mutex_unlock(&state_lock);
 
 out:
@@ -468,11 +474,19 @@ int register_memlat(struct device *dev, struct memlat_hwmon *hw)
 	mutex_lock(&state_lock);
 	node->gov = &devfreq_gov_memlat;
 	node->attr_grp = &memlat_dev_attr_group;
+	mutex_lock(&list_lock);
+	list_add_tail(&node->list, &memlat_list);
+	mutex_unlock(&list_lock);
 
 	if (!memlat_use_cnt)
 		ret = devfreq_add_governor(&devfreq_gov_memlat);
 	if (!ret)
 		memlat_use_cnt++;
+	else {
+		mutex_lock(&list_lock);
+		list_del_init(&node->list);
+		mutex_unlock(&list_lock);
+	}
 	mutex_unlock(&state_lock);
 
 out:
