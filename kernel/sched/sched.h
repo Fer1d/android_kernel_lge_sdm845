@@ -1414,7 +1414,7 @@ static inline int task_running(struct rq *rq, struct task_struct *p)
 
 static inline int task_on_rq_queued(struct task_struct *p)
 {
-	return p->on_rq == TASK_ON_RQ_QUEUED;
+	return READ_ONCE(p->on_rq) == TASK_ON_RQ_QUEUED;
 }
 
 static inline int task_on_rq_migrating(struct task_struct *p)
@@ -2982,6 +2982,7 @@ static inline int same_freq_domain(int src_cpu, int dst_cpu)
 	return 1;
 }
 
+static inline int mark_reserved(int cpu) { return 0; }
 static inline void clear_reserved(int cpu) { }
 static inline int alloc_related_thread_groups(void) { return 0; }
 
