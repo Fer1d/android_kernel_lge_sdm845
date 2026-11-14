@@ -274,6 +274,14 @@ static int __init poc_sysctl_init(void)
 {
 	if (!register_sysctl("kernel", poc_sysctls))
 		return -ENOMEM;
+	if (IS_ENABLED(CONFIG_SCHED_POC_DEFAULT_ACTIVE)) {
+		/* Match sysctl lock order and the complete writer/resync protocol. */
+		mutex_lock(&poc_control_lock);
+		get_online_cpus();
+		poc_set_mode(2);
+		put_online_cpus();
+		mutex_unlock(&poc_control_lock);
+	}
 	return 0;
 }
 late_initcall(poc_sysctl_init);

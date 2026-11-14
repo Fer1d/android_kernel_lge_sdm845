@@ -10,6 +10,12 @@ parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent
 parser.add_argument('--cc', default='gcc')
 args = parser.parse_args()
 root = args.root.resolve()
+kconfig = (root / 'init/Kconfig').read_text()
+for name, parent in [('SCHED_BORE_DEFAULT_ON', 'SCHED_BORE'),
+                     ('SCHED_POC_DEFAULT_ACTIVE', 'SCHED_POC_SELECTOR')]:
+    entry = kconfig.split('config ' + name + '\n', 1)[1].split('\nconfig ', 1)[0]
+    assert '\tdepends on ' + parent + '\n' in entry
+    assert '\tdefault n\n' in entry
 source = (root / 'kernel/sched/bore.c').read_text()
 source = '\n'.join(line for line in source.splitlines() if not line.startswith('#include'))
 header = (root / 'include/linux/sched.h').read_text()
@@ -25,6 +31,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 #define U64_MAX UINT64_MAX
+#define IS_ENABLED(c) (c)
 #define __ro_after_init
 #define __read_mostly
 #define __init
@@ -146,10 +153,86 @@ for line in sysctl.splitlines():
 assert '.mode = 0444' in sysctl[sysctl.index('.procname = "sched_bore"'):][:200]
 assert '__ro_after_init' in source and '__setup("sched_bore=", bore_setup)' in source
 print('ok static integration: sleep ordering, real runtime, DEBUG=n constants, boot-fixed flag', flush=True)
+
+# Compile the complete shared initializer, not a Python model of its reset.
+core = (root / 'kernel/sched/core.c').read_text()
+def c_function(text, signature):
+    a = text.index(signature)
+    b = text.index('{', a)
+    level, i = 1, b + 1
+    while level:
+        if text[i] == '{': level += 1
+        elif text[i] == '}': level -= 1
+        i += 1
+    return text[a:i] + '\n'
+shared = c_function(core, 'static void __sched_fork(')
+idle = c_function(core, 'void init_idle(')
+fork = c_function(core, 'int sched_fork(')
+assert '__sched_fork(0, idle);' in idle and 'bore_fork(' not in idle
+assert fork.index('__sched_fork(clone_flags, p);') < fork.index('bore_fork(p, current);')
+assert '#ifdef CONFIG_SCHED_BORE\n' in shared
+lifecycle_shim = r'''
+struct task_struct {
+    struct bore_ctx bore;
+    int on_rq;
+    struct { int on_rq, group_node; u64 exec_start, sum_exec_runtime,
+        prev_sum_exec_runtime, nr_migrations, vruntime; } se;
+    u64 last_sleep_ts, last_cpu_selected_ts;
+    struct { int rb_node; } dl;
+    struct { int run_list, timeout, time_slice, on_rq, on_list; } rt;
+};
+#define INIT_LIST_HEAD(p) (*(p)=0)
+#define RB_CLEAR_NODE(p) (*(p)=0)
+#define init_dl_task_timer(p) ((void)(p))
+#define __dl_clear_params(p) ((void)(p))
+static int sched_rr_timeslice = 100;
+'''
+lifecycle_tests = r'''
+static void clean(struct task_struct *p) {
+    assert(!p->bore.burst_time && !p->bore.curr_penalty &&
+           !p->bore.prev_penalty && !p->bore.penalty);
+}
+int main(int argc, char **argv) {
+    struct task_struct parent, child, idle;
+    unsigned int expected = CONFIG_SCHED_BORE_DEFAULT_ON;
+    assert(sysctl_sched_bore == expected);
+    assert(!bore_setup("2") && !bore_setup("garbage"));
+    assert(sysctl_sched_bore == expected);
+    if (argc > 1) { assert(bore_setup(argv[1])); expected = atoi(argv[1]); }
+    assert(sysctl_sched_bore == expected);
+    memset(&parent, 0xa5, sizeof(parent)); parent.bore.penalty = 960;
+    idle = parent;
+    __sched_fork(0, &idle); clean(&idle);
+    child = parent;
+    __sched_fork(0, &child); clean(&child);
+    bore_fork(&child, &parent);
+    assert(!child.bore.burst_time && !child.bore.curr_penalty);
+    assert(child.bore.prev_penalty == (expected ? 960 : 0));
+    assert(child.bore.penalty == child.bore.prev_penalty);
+    assert(parent.bore.penalty == 960);
+    sysctl_sched_burst_inherit_type = 0;
+    child = parent; __sched_fork(0, &child); bore_fork(&child, &parent);
+    clean(&child);
+    puts("PASS actual C: config default/cmdline override/shared idle reset/fork inheritance");
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory(prefix='bore-boot-test-') as temp:
+    temp = Path(temp)
+    for default in (0, 1):
+        c = temp / ('boot%d.c' % default)
+        binary = temp / ('boot%d' % default)
+        c.write_text('#define CONFIG_SCHED_BORE 1\n#define CONFIG_SCHED_BORE_DEFAULT_ON %d\n' % default +
+                     shim + ctx + lifecycle_shim + source + shared + lifecycle_tests)
+        subprocess.run([args.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', '-fsanitize=address,undefined',
+                        '-fno-pie', '-no-pie', str(c), '-o', str(binary)], check=True)
+        for cmdline in ([], ['0'], ['1']):
+            subprocess.run([str(binary), *cmdline], check=True)
 with tempfile.TemporaryDirectory(prefix='bore-selftest-') as temp:
     temp = Path(temp)
     c = temp / 'extracted.c'
-    c.write_text(shim + ctx + '\nstruct task_struct { struct bore_ctx bore; };\n' + source + tests)
+    c.write_text('#define CONFIG_SCHED_BORE_DEFAULT_ON 0\n' + shim + ctx + '\nstruct task_struct { struct bore_ctx bore; };\n' + source + tests)
     for name, flags in [('normal', []), ('asan-ubsan', ['-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-fno-pie', '-no-pie'])]:
         binary = temp / name
         subprocess.run([args.cc, '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror', *flags, str(c), '-o', str(binary)], check=True)

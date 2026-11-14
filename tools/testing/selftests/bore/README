@@ -8,14 +8,17 @@ Algorithm source: Baka 0b1b6bdf6ce9ca6bba51cb9c9b918e4f027474f3,
 kernel/sched/bore.c and scheduler integration from that commit.
 This is an experimental source-derived CFS adaptation, NOT the complete
 upstream BORE 7 scheduler or an EEVDF backport. No ADIOS, Cambyses or POC
-implementation/configuration is imported; existing POC defaults and logic
-are unchanged. No defconfig is changed.
+algorithm is imported by the BORE adaptation. Optional boot defaults for BORE
+and POC are described below; their algorithms remain unchanged. No defconfig
+is changed.
 
 Enable and concurrency contract
 -------------------------------
-CONFIG_SCHED_BORE defaults to n. With it enabled, runtime still defaults off.
-Pass sched_bore=1 on the kernel command line to enable for that boot;
-sched_bore=0 is the default. Only literal numeric values 0/1 are accepted
+CONFIG_SCHED_BORE defaults to n. CONFIG_SCHED_BORE_DEFAULT_ON depends on
+CONFIG_SCHED_BORE and defaults to n. The boot-fixed enable flag is initialized
+from CONFIG_SCHED_BORE_DEFAULT_ON (off when n, on when y). Pass sched_bore=0
+or sched_bore=1 on the kernel command line to override either default for that
+boot. Invalid values leave the existing default intact. Numeric 0/1 are accepted
 (base-0 parsing). The sysctl kernel.sched_bore is read-only (0444), backed by
 __ro_after_init storage. There is no supported hot enable/disable, no task
 walk and no generation reset. Production cannot re-enable stale state.
@@ -82,7 +85,13 @@ sleep then leaves previous/effective=480 and current/burst=0 at s=1.
 
 Hooks and preserved paths
 -------------------------
-core.c sched_fork: after init_entity_runnable_average, before class task_fork.
+core.c __sched_fork: explicitly clears all BORE state for both init_idle and
+sched_fork, even with BORE boot-disabled. Thus idle initialization never keeps
+copied penalties or inherits a parent's state. This shared reset runs before
+sched_fork can reject a deadline-policy child. core.c sched_fork subsequently
+calls bore_fork after init_entity_runnable_average, before class task_fork;
+only this normal fork path inherits the direct parent's effective penalty when
+boot-enabled and inherit_type=1. The penalty algorithm is unchanged.
 fair.c update_curr: only task entities route their already nice-weighted
 calc_delta_fair result through bore_account_delta. Group entities retain the
 original calc_delta_fair path. sum_exec_runtime, exec_clock, cpuacct, group
@@ -114,9 +123,41 @@ sleep and boot parser with GCC. It does not reimplement BORE in Python.
 Both ordinary and ASan+UBSan binaries run normal/edge/golden/fork/off tests,
 200000 deterministic u128 multiplication-reference comparisons, all smooth
 shifts, burst saturation, tuning endpoints, and 10000 off-state identities.
+Additional ASan+UBSan actual-C binaries cover both config defaults crossed
+with absent/sched_bore=0/sched_bore=1 command lines (six fresh processes),
+invalid parser input preserving the default, the complete extracted shared
+__sched_fork initializer with dirty idle/child state, and normal fork inheritance
+on/off. Static checks verify init_idle uses the shared initializer without
+inheritance and normal fork resets before inheriting. Existing off assertions
+and algorithm tests are retained.
 Non-PIE sanitizer binaries avoid host ASan shadow-map placement conflicts.
 Static checks inspect sleep ordering/gating, real-runtime statements,
 DEBUG-independent sysctl constants and immutable enable wiring.
+
+POC optional boot default and tests
+-----------------------------------
+CONFIG_SCHED_POC_DEFAULT_ACTIVE depends on CONFIG_SCHED_POC_SELECTOR and
+also defaults to n. poc_mode and both static keys always start at zero/off;
+there is no static mode=2 initialization. In late_initcall poc_sysctl_init,
+register_sysctl must succeed first. With the default-active option selected,
+lock order is poc_control_lock mutex -> get_online_cpus -> existing
+poc_set_mode(2) -> put_online_cpus -> mutex unlock (same as sysctl writes).
+The setter disables readers, waits for synchronize_sched, publishes mode 0,
+disables writers, waits again and clears the bitmap. It then enables writers,
+resynchronizes online CPUs via on_each_cpu, publishes mode 2 and enables
+readers. Failed registration returns -ENOMEM without locks or activation.
+The runtime sched_poc_mode interface remains available for modes 0/1/2.
+
+  python3 -I tools/testing/selftests/poc/run.py
+
+Both default-off/default-active variants compile the actual registration and
+sysctl C with UBSan. Tests require initially-off state, failed registration
+staying off with no setter effects, successful locked activation through the
+real setter/resync, idempotence, and sysctl parsing/transitions. Mocks assert
+mutex-before-hotplug and writer-before-resync-before-reader ordering. Existing
+off/shadow/active, rejection, fair-loop and full 0943 token-equivalence
+assertions remain. The latter now strips the independent later BORE/Cambyses
+config-guarded additions as well as POC to compare the all-disabled path.
 
 These are host extraction tests, NOT a kernel configuration build, boot,
 lockdep/KCSAN test, cgroup integration test or device latency/power benchmark.

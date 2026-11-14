@@ -2854,6 +2854,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
 
+#ifdef CONFIG_SCHED_BORE
+	/* Shared by init_idle() and fork; only sched_fork() inherits later. */
+	memset(&p->bore, 0, sizeof(p->bore));
+#endif
+
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;

@@ -10,7 +10,8 @@
 #include <linux/math64.h>
 
 /* Boot-fixed: no task walk, stale-state re-enable or live vruntime rollback. */
-unsigned int sysctl_sched_bore __ro_after_init;
+unsigned int sysctl_sched_bore __ro_after_init =
+	IS_ENABLED(CONFIG_SCHED_BORE_DEFAULT_ON);
 unsigned int sysctl_sched_burst_penalty_offset __read_mostly = 24;
 unsigned int sysctl_sched_burst_penalty_scale __read_mostly = 1536;
 unsigned int sysctl_sched_burst_smoothness __read_mostly = 1;

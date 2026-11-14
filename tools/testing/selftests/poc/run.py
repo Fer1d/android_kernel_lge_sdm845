@@ -235,16 +235,22 @@ def without_poc(text):
     lines = text.splitlines(keepends=True)
     out = []; depth = 0; keep = True
     for line in lines:
-        if not depth and line.strip() == '#ifdef CONFIG_SCHED_POC_SELECTOR':
+        # Later independent experiments must also be disabled to compare
+        # against the original 0943 fair.c; keep the original full assertion.
+        if line.strip() == '#include <linux/sched/bore.h>':
+            continue
+        if not depth and line.strip() in ('#ifdef CONFIG_SCHED_POC_SELECTOR',
+                                         '#ifdef CONFIG_SCHED_BORE',
+                                         '#ifdef CONFIG_SCHED_CAMBYSES_BUDGET'):
             depth = 1; keep = False; continue
         if depth:
             if line.lstrip().startswith(('#if ', '#ifdef ', '#ifndef ')):
                 depth += 1
-            elif line.strip() == '#endif':
+            elif line.strip().startswith('#endif'):
                 depth -= 1
                 if not depth:
                     keep = True; continue
-            elif line.strip() == '#else' and depth == 1:
+            elif line.strip().startswith('#else') and depth == 1:
                 keep = True; continue
             if keep:
                 out.append(line)
@@ -333,13 +339,14 @@ control_shim = r'''
 #define SYSCTL_WRITES_STRICT 1
 #define SYSCTL_WRITES_WARN 0
 int sysctl_writes_strict=1, locked, hotplug_locked, registration_fail;
+int registration_calls, mutex_calls, resync_calls;
 typedef long long loff_t;
 struct ctl_table {
  const char *procname; void *data; int maxlen,mode;
  int (*proc_handler)(struct ctl_table *,int,void *,size_t *,loff_t *);
  void *extra1,*extra2;
 };
-static void mutex_lock(int *p) { (void)p; assert(!locked); locked=1; }
+static void mutex_lock(int *p) { (void)p; assert(!locked && registration_calls && !registration_fail); locked=1; mutex_calls++; }
 static void mutex_unlock(int *p) { (void)p; assert(locked && !hotplug_locked); locked=0; }
 static void get_online_cpus(void) { assert(locked && !hotplug_locked); hotplug_locked=1; }
 static void put_online_cpus(void) { assert(hotplug_locked); hotplug_locked=0; }
@@ -357,6 +364,7 @@ static int proc_doulongvec_minmax(struct ctl_table *t,int w,void *b,size_t *n,lo
 }
 static void *register_sysctl(const char *path,struct ctl_table *t) {
  int n=0; assert(!strcmp(path,"kernel"));
+ assert(!locked && !hotplug_locked); registration_calls++;
  while(t[n].procname) { assert(n<2 && t[n].proc_handler); n++; }
  assert(n==2 && t[0].mode==0644 && t[1].mode==0444);
  return registration_fail ? NULL : t;
@@ -373,8 +381,27 @@ static int write_mode(char *text,loff_t pos) {
 }
 int main(void) {
  char b[32]={0}; size_t n=sizeof(b); loff_t pos=0; reset();
- assert(poc_sysctl_init()==0); registration_fail=1;
- assert(poc_sysctl_init()==-ENOMEM); registration_fail=0;
+ assert(!poc_mode && !sched_poc_writer && !sched_poc_reader && !poc_idle_mask.v);
+ registration_fail=1;
+ assert(poc_sysctl_init()==-ENOMEM);
+ assert(!poc_mode && !sched_poc_writer && !sched_poc_reader && !poc_idle_mask.v);
+ assert(!graces && !mutex_calls && !resync_calls && !locked && !hotplug_locked);
+ registration_fail=0;
+ assert(poc_sysctl_init()==0);
+ assert(!locked && !hotplug_locked);
+ if (CONFIG_SCHED_POC_DEFAULT_ACTIVE) {
+  assert(poc_mode==2 && sched_poc_writer && sched_poc_reader);
+  assert(poc_idle_mask.v==255 && graces==2 && mutex_calls==1 && resync_calls==1);
+  int g=graces; assert(poc_sysctl_init()==0 && graces==g && resync_calls==1);
+ } else {
+  assert(!poc_mode && !sched_poc_writer && !sched_poc_reader && !poc_idle_mask.v);
+  assert(!graces && !mutex_calls && !resync_calls);
+ }
+ registration_fail=1;
+ int old_mode=poc_mode, old_graces=graces, old_calls=mutex_calls;
+ assert(poc_sysctl_init()==-ENOMEM);
+ assert(poc_mode==old_mode && graces==old_graces && mutex_calls==old_calls);
+ registration_fail=0;
  assert(write_mode("2\n",0)==0 && poc_mode==2);
  int g=graces; assert(write_mode("2",0)==0 && graces==g);
  assert(write_mode("3",0)==-EINVAL && poc_mode==2);
@@ -394,7 +421,18 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory(prefix='poc-control-test-') as temp:
     c = pathlib.Path(temp) / 'control.c'; exe = pathlib.Path(temp) / 'control'
-    c.write_text(shim + control_shim + parser + source + controls + reset_fn + control_tests)
-    subprocess.run(['cc','-std=gnu99','-fsanitize=undefined','-fno-sanitize-recover=all',str(c),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
+    # Instrument the real setter and resync entry: activation must not bypass
+    # either the existing transition protocol or its caller's lock contract.
+    control_source = source.replace('static void poc_set_mode(int mode)\n{',
+        'static void poc_set_mode(int mode)\n{\n assert(locked && hotplug_locked);')
+    control_source = control_source.replace('static void poc_resync_cpu(void *unused)\n{',
+        'static void poc_resync_cpu(void *unused)\n{\n'
+        ' assert(locked && hotplug_locked && sched_poc_writer && !sched_poc_reader && !poc_mode);\n'
+        ' if (!smp_processor_id()) resync_calls++;')
+    for default in (0, 1):
+        c.write_text('#define CONFIG_SCHED_POC_DEFAULT_ACTIVE %d\n' % default +
+                     shim + control_shim + parser + control_source + controls + reset_fn + control_tests)
+        subprocess.run(['cc','-std=gnu99','-fsanitize=undefined','-fno-sanitize-recover=all',str(c),'-o',str(exe)],check=True)
+        subprocess.run([str(exe)],check=True)
+        print('PASS POC default=%d: initial off/failure stays off/locked setter/resync/idempotence' % default)
 print('BOUNDARY: mocked uaccess/registration/locks; no real procfs, SMP concurrency or kernel build validation')

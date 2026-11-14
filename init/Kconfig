@@ -1462,8 +1462,18 @@ config SCHED_BORE
 	  Burst-based task vruntime scaling derived from Baka commit
 	  0b1b6bdf6ce9. This is NOT the complete upstream BORE 7 scheduler.
 	  Real runtime, group entities, bandwidth and WALT remain unchanged.
-	  Disabled at runtime unless sched_bore=1 is passed at boot; the enable
-	  flag is read-only after boot. No live switching or vruntime rollback.
+	  Runtime defaults off unless SCHED_BORE_DEFAULT_ON is selected.
+	  sched_bore=0/1 overrides the default; the enable flag is read-only
+	  after boot. No live switching or vruntime rollback.
+	  If unsure, say N.
+
+config SCHED_BORE_DEFAULT_ON
+	bool "Enable BORE by default at boot"
+	depends on SCHED_BORE
+	default n
+	help
+	  Initialize the boot-fixed BORE enable flag to 1. sched_bore=0 or
+	  sched_bore=1 on the command line overrides this default.
 	  If unsure, say N.
 
 config SCHED_POC_SELECTOR
@@ -1472,8 +1482,20 @@ config SCHED_POC_SELECTOR
 	default n
 	help
 	  Fixed atomic64 idle bitmap selector derived from POC v2.6.3.
-	  Runtime mode defaults to 0 (off); 1 observes candidates and 2 enables
-	  restricted selection. WALT/EAS policy and fallback remain in charge.
+	  Runtime mode starts at 0 (off); 1 observes candidates and 2 enables
+	  restricted selection. SCHED_POC_DEFAULT_ACTIVE can select mode 2
+	  after successful late sysctl registration. WALT/EAS policy and fallback
+	  remain in charge.
+	  If unsure, say N.
+
+config SCHED_POC_DEFAULT_ACTIVE
+	bool "Activate POC after late sysctl registration"
+	depends on SCHED_POC_SELECTOR
+	default n
+	help
+	  After successful late sysctl registration, use the runtime mode setter
+	  to enable restricted active mode (2). Registration failure stays off.
+	  The sched_poc_mode sysctl can still select off, shadow or active mode.
 	  If unsure, say N.
 
 config SCHED_CAMBYSES_BUDGET
