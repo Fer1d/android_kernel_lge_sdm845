@@ -1455,6 +1455,17 @@ config SCHED_AUTOGROUP
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
 
+config SCHED_BORE
+	bool "Experimental source-derived BORE CFS adaptation"
+	default n
+	help
+	  Burst-based task vruntime scaling derived from Baka commit
+	  0b1b6bdf6ce9. This is NOT the complete upstream BORE 7 scheduler.
+	  Real runtime, group entities, bandwidth and WALT remain unchanged.
+	  Disabled at runtime unless sched_bore=1 is passed at boot; the enable
+	  flag is read-only after boot. No live switching or vruntime rollback.
+	  If unsure, say N.
+
 config SCHED_POC_SELECTOR
 	bool "Piece-Of-Cake idle candidate experiment"
 	depends on SMP && 64BIT && SYSCTL && NR_CPUS <= 64

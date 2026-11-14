@@ -287,6 +287,13 @@ static int min_extfrag_threshold;
 static int max_extfrag_threshold = 1000;
 #endif
 
+#ifdef CONFIG_SCHED_BORE
+/* Must also exist when CONFIG_SCHED_DEBUG=n. */
+static int bore_max_offset = 255;
+static int bore_max_scale = 65535;
+static int bore_max_smoothness = 16;
+#endif
+
 static struct ctl_table kern_table[] = {
 	{
 		.procname	= "sched_child_runs_first",
@@ -530,6 +537,53 @@ static struct ctl_table kern_table[] = {
 	},
 #endif /* CONFIG_NUMA_BALANCING */
 #endif /* CONFIG_SCHED_DEBUG */
+#ifdef CONFIG_SCHED_BORE
+	{
+		.procname = "sched_bore",
+		.data = &sysctl_sched_bore,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0444,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &zero,
+		.extra2 = &one,
+	},
+	{
+		.procname = "sched_burst_penalty_offset",
+		.data = &sysctl_sched_burst_penalty_offset,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &zero,
+		.extra2 = &bore_max_offset,
+	},
+	{
+		.procname = "sched_burst_penalty_scale",
+		.data = &sysctl_sched_burst_penalty_scale,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &zero,
+		.extra2 = &bore_max_scale,
+	},
+	{
+		.procname = "sched_burst_smoothness",
+		.data = &sysctl_sched_burst_smoothness,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &zero,
+		.extra2 = &bore_max_smoothness,
+	},
+	{
+		.procname = "sched_burst_inherit_type",
+		.data = &sysctl_sched_burst_inherit_type,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1 = &zero,
+		.extra2 = &one,
+	},
+#endif /* CONFIG_SCHED_BORE */
 	{
 		.procname	= "sched_rt_period_us",
 		.data		= &sysctl_sched_rt_period,

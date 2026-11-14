@@ -1,0 +1,126 @@
+Experimental source-derived BORE CFS adaptation
+==============================================
+
+Provenance and scope
+--------------------
+Base tree: e79065c41a09ffa38baa6547f13c1471ce003695.
+Algorithm source: Baka 0b1b6bdf6ce9ca6bba51cb9c9b918e4f027474f3,
+kernel/sched/bore.c and scheduler integration from that commit.
+This is an experimental source-derived CFS adaptation, NOT the complete
+upstream BORE 7 scheduler or an EEVDF backport. No ADIOS, Cambyses or POC
+implementation/configuration is imported; existing POC defaults and logic
+are unchanged. No defconfig is changed.
+
+Enable and concurrency contract
+-------------------------------
+CONFIG_SCHED_BORE defaults to n. With it enabled, runtime still defaults off.
+Pass sched_bore=1 on the kernel command line to enable for that boot;
+sched_bore=0 is the default. Only literal numeric values 0/1 are accepted
+(base-0 parsing). The sysctl kernel.sched_bore is read-only (0444), backed by
+__ro_after_init storage. There is no supported hot enable/disable, no task
+walk and no generation reset. Production cannot re-enable stale state.
+A future live disable would stop only future scaling: historical vruntime
+would NOT be rolled back. Do not make the sysctl writable without designing
+that transition and state reset first.
+
+Each accounting call takes one enable snapshot for both burst update and
+scaling; sleep and fork also take one snapshot. The enable flag is immutable
+after boot. Other tunables use READ_ONCE once per helper calculation, but
+multiple independent sysctl writes are NOT an atomic tuning transaction.
+State updates run under the existing rq scheduling serialization; fork
+initializes a private child and reads the running parent's penalty. No
+additional cross-task scanning, locks or policy-class changes are added.
+
+Tunables (under /proc/sys/kernel)
+--------------------------------
+sched_burst_penalty_offset: 0..255, default 24.
+sched_burst_penalty_scale: 0..65535, default 1536.
+sched_burst_smoothness: 0..16, default 1 (exact supported shift range).
+sched_burst_inherit_type: 0..1, default 1. 0 means no inheritance; 1 copies
+only the direct parent's effective penalty. No ancestor/tree/cache modes
+are implemented or advertised. Fork always clears burst/current state,
+including when disabled. All bounds exist with CONFIG_SCHED_DEBUG=n.
+
+Fixed-point math (source-compatible, not an exact logarithm)
+----------------------------------------------------------
+For burst time n > 0, let L = fls64(n) in [1,64]. The source interpolation is
+  q = (L << 8) | (((n << (64-L)) mod 2^64) >> 56)
+  current = min(10239, floor(max(0,q - offset*256) * scale / 1024)).
+q and penalties use Q8 units: 256 = 1. The normalized mantissa byte includes
+the leading 1 bit (128..255); q is NOT floor(256*log2(n+1)). We intentionally
+retain this source convention rather than silently substituting another
+logarithm. n=0 returns 0 before computing shifts; 64-L is always 0..63.
+Burst accumulation saturates at U64_MAX instead of wrapping.
+
+For smoothing shift s in [0,16],
+  smooth(previous,current) = floor((previous*(2^s-1)+current)/2^s).
+Sleep saves this smoothed penalty, clears current and burst, and sets the
+effective penalty to the saved value. During execution effective is
+max(current, smooth(previous,current)); previous is not advanced on ticks.
+At s=0 history is discarded. At s=16 all intermediates still fit in u32
+for penalties <=10239 (even the entire u16 input range is safe).
+
+Integer scaling deliberately drops the Q8 fractional byte:
+  k = min(effective >> 8,39)
+  virtual_delta = sat_u64(floor(CFS_delta * (40+k) / 40)).
+Thus the multiplier is 1..1.975, not an upstream BORE nice-weight mapping.
+Write CFS_delta = 40*a+b, b<40. Compute tail=floor(b*(40+k)/40).
+If a > floor((U64_MAX-tail)/(40+k)), return U64_MAX; otherwise return
+ a*(40+k)+tail. This avoids overflow BEFORE multiplication. Capping an
+already-overflowed product (as in the source) does not work.
+
+Default offset=24, scale=1536 golden burst -> current penalty:
+  0 -> 0
+  1 -> 0
+  8388607 (2^23-1) -> 0
+  8388608 (2^23) -> 192
+  16777216 (2^24) -> 576
+  33554432 (2^25) -> 960
+  U64_MAX -> 10239
+Starting from zero, runtime=33554432 and CFS_delta=1000 produce 1075;
+sleep then leaves previous/effective=480 and current/burst=0 at s=1.
+
+Hooks and preserved paths
+-------------------------
+core.c sched_fork: after init_entity_runnable_average, before class task_fork.
+fair.c update_curr: only task entities route their already nice-weighted
+calc_delta_fair result through bore_account_delta. Group entities retain the
+original calc_delta_fair path. sum_exec_runtime, exec_clock, cpuacct, group
+runtime and CFS bandwidth continue to receive unscaled real delta_exec.
+No WALT, Uclamp, load tracking, wakeup placement or calc_delta_fair global
+semantics are changed. This does NOT prove workload-level equivalence when
+BORE is enabled: task shares and scheduling order intentionally change.
+fair.c dequeue_entity: immediately after update_curr, gated by DEQUEUE_SLEEP
+and entity_is_task. It does not depend on schedstats. Migration/requeue
+without DEQUEUE_SLEEP does not terminate a burst.
+
+With boot-off, bore_account_delta returns exactly the original CFS delta
+without touching burst state, and sleep is a no-op. Compiled-in off still
+has call/branch overhead and task_struct storage; it is not binary-identical
+to CONFIG_SCHED_BORE=n. Existing vruntime unsigned addition/wrap semantics
+are unchanged. Saturation protects the delta multiplication, not arbitrary
+unbounded synthetic vruntime additions; real update_curr rejects nonpositive
+signed deltas. No stronger global wrap guarantee is claimed.
+
+Persistent host tests (no kernel build)
+--------------------------------------
+  python3 -I tools/testing/selftests/bore/run.py
+or
+  make -C tools/testing/selftests/bore run_tests
+
+The runner extracts actual bore.c C and the actual bore_ctx definition,
+provides only kernel API/type shims, and compiles the real algorithm, fork,
+sleep and boot parser with GCC. It does not reimplement BORE in Python.
+Both ordinary and ASan+UBSan binaries run normal/edge/golden/fork/off tests,
+200000 deterministic u128 multiplication-reference comparisons, all smooth
+shifts, burst saturation, tuning endpoints, and 10000 off-state identities.
+Non-PIE sanitizer binaries avoid host ASan shadow-map placement conflicts.
+Static checks inspect sleep ordering/gating, real-runtime statements,
+DEBUG-independent sysctl constants and immutable enable wiring.
+
+These are host extraction tests, NOT a kernel configuration build, boot,
+lockdep/KCSAN test, cgroup integration test or device latency/power benchmark.
+Follow-up kernel builds (BORE n/y, DEBUG n/y, SCHEDSTATS n/y, group scheduling)
+and on-device testing remain necessary before deployment. No kernel build
+is performed by this test target. The test is standalone; the top-level
+selftests Makefile is intentionally untouched to respect file ownership.

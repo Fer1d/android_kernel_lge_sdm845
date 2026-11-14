@@ -1701,6 +1701,16 @@ struct tlbflush_unmap_batch {
 	bool writable;
 };
 
+#ifdef CONFIG_SCHED_BORE
+/* Experimental source-derived CFS burst state, not upstream BORE 7. */
+struct bore_ctx {
+	u64 burst_time;
+	u16 prev_penalty;
+	u16 curr_penalty;
+	u16 penalty;
+};
+#endif
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -1733,6 +1743,9 @@ struct task_struct {
 	unsigned int rt_priority;
 	const struct sched_class *sched_class;
 	struct sched_entity se;
+#ifdef CONFIG_SCHED_BORE
+	struct bore_ctx bore;
+#endif
 	struct sched_rt_entity rt;
 	u64 last_sleep_ts;
 	u64 last_cpu_selected_ts;

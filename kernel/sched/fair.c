@@ -33,6 +33,7 @@
 #include <linux/module.h>
 
 #include "sched.h"
+#include <linux/sched/bore.h>
 #include "tune.h"
 #include "walt.h"
 #include <trace/events/sched.h>
@@ -902,7 +903,13 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	curr->sum_exec_runtime += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
-	curr->vruntime += calc_delta_fair(delta_exec, curr);
+#ifdef CONFIG_SCHED_BORE
+	if (entity_is_task(curr))
+		curr->vruntime += bore_account_delta(task_of(curr), delta_exec,
+					calc_delta_fair(delta_exec, curr));
+	else
+#endif
+		curr->vruntime += calc_delta_fair(delta_exec, curr);
 	update_min_vruntime(cfs_rq);
 
 	if (entity_is_task(curr)) {
@@ -3798,6 +3805,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+#ifdef CONFIG_SCHED_BORE
+	/* Independent of schedstats; finish accounting before ending a burst. */
+	if ((flags & DEQUEUE_SLEEP) && entity_is_task(se))
+		bore_sleep(task_of(se));
+#endif
 
 	/*
 	 * When dequeuing a sched_entity, we must:
