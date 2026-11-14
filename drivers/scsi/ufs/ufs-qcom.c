@@ -1242,6 +1242,19 @@ store_ufs_to_mem_max_bus_bw(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
+static void ufs_qcom_bus_unregister(struct ufs_qcom_host *host)
+{
+	if (host->bus_vote.max_bus_bw_created) {
+		/* Removal waits for callbacks before the client is released. */
+		device_remove_file(host->hba->dev, &host->bus_vote.max_bus_bw);
+		host->bus_vote.max_bus_bw_created = false;
+	}
+	if (host->bus_vote.client_handle) {
+		msm_bus_scale_unregister_client(host->bus_vote.client_handle);
+		host->bus_vote.client_handle = 0;
+	}
+}
+
 static int ufs_qcom_bus_register(struct ufs_qcom_host *host)
 {
 	int err;
@@ -1261,6 +1274,8 @@ static int ufs_qcom_bus_register(struct ufs_qcom_host *host)
 	if (err < 0 || err != bus_pdata->num_usecases) {
 		dev_err(dev, "%s: qcom,bus-vector-names not specified correctly %d\n",
 				__func__, err);
+		if (err >= 0)
+			err = -EINVAL;
 		goto out;
 	}
 
@@ -1282,6 +1297,10 @@ static int ufs_qcom_bus_register(struct ufs_qcom_host *host)
 	host->bus_vote.max_bus_bw.attr.name = "max_bus_bw";
 	host->bus_vote.max_bus_bw.attr.mode = S_IRUGO | S_IWUSR;
 	err = device_create_file(dev, &host->bus_vote.max_bus_bw);
+	if (err)
+		ufs_qcom_bus_unregister(host);
+	else
+		host->bus_vote.max_bus_bw_created = true;
 out:
 	return err;
 }
@@ -1300,7 +1319,7 @@ static int ufs_qcom_bus_register(struct ufs_qcom_host *host)
 {
 	return 0;
 }
-static inline void msm_bus_scale_unregister_client(uint32_t cl)
+static void ufs_qcom_bus_unregister(struct ufs_qcom_host *host)
 {
 }
 #endif /* CONFIG_QCOM_BUS_SCALING */
@@ -1650,14 +1669,14 @@ static void ufs_qcom_pm_qos_req_start(struct ufs_hba *hba, struct request *req)
 		return;
 
 	host = ufshcd_get_variant(hba);
-	if (!host->pm_qos.groups)
+	if (!host)
 		return;
 
-	group = &host->pm_qos.groups[ufs_qcom_cpu_to_group(host, req->cpu)];
-
 	spin_lock_irqsave(hba->host->host_lock, flags);
-	if (!host->pm_qos.is_enabled)
+	if (!host->pm_qos.initialized || !host->pm_qos.is_enabled)
 		goto out;
+
+	group = &host->pm_qos.groups[ufs_qcom_cpu_to_group(host, req->cpu)];
 
 	group->active_reqs++;
 	if (group->state != PM_QOS_REQ_VOTE &&
@@ -1674,7 +1693,7 @@ static void __ufs_qcom_pm_qos_req_end(struct ufs_qcom_host *host, int req_cpu)
 {
 	struct ufs_qcom_pm_qos_cpu_group *group;
 
-	if (!host->pm_qos.groups || !host->pm_qos.is_enabled)
+	if (!host || !host->pm_qos.initialized || !host->pm_qos.is_enabled)
 		return;
 
 	group = &host->pm_qos.groups[ufs_qcom_cpu_to_group(host, req_cpu)];
@@ -1767,6 +1786,7 @@ static ssize_t ufs_qcom_pm_qos_enable_store(struct device *dev,
 		return -EINVAL;
 
 	enable = !!value;
+	mutex_lock(&host->pm_qos.lock);
 
 	/*
 	 * Must take the spinlock and save irqs before changing the enabled
@@ -1775,6 +1795,7 @@ static ssize_t ufs_qcom_pm_qos_enable_store(struct device *dev,
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	if (enable == host->pm_qos.is_enabled) {
 		spin_unlock_irqrestore(hba->host->host_lock, flags);
+		mutex_unlock(&host->pm_qos.lock);
 		return count;
 	}
 	host->pm_qos.is_enabled = enable;
@@ -1792,6 +1813,7 @@ static ssize_t ufs_qcom_pm_qos_enable_store(struct device *dev,
 				PM_QOS_DEFAULT_VALUE);
 		}
 
+	mutex_unlock(&host->pm_qos.lock);
 	return count;
 }
 
@@ -1863,6 +1885,7 @@ static int ufs_qcom_pm_qos_init(struct ufs_qcom_host *host)
 	int ret = 0;
 	int num_groups;
 	int num_values;
+	unsigned long flags;
 	char wq_name[sizeof("ufs_pm_qos_00")];
 	int i;
 
@@ -1957,6 +1980,11 @@ static int ufs_qcom_pm_qos_init(struct ufs_qcom_host *host)
 		pm_qos_add_request(&host->pm_qos.groups[i].req,
 			PM_QOS_CPU_DMA_LATENCY, PM_QOS_DEFAULT_VALUE);
 
+	spin_lock_irqsave(host->hba->host->host_lock, flags);
+	host->pm_qos.initialized = true;
+	host->pm_qos.is_enabled = true;
+	spin_unlock_irqrestore(host->hba->host->host_lock, flags);
+
 	/* PM QoS latency sys-fs attribute */
 	attr = &host->pm_qos.latency_attr;
 	attr->show = ufs_qcom_pm_qos_latency_show;
@@ -1966,6 +1994,8 @@ static int ufs_qcom_pm_qos_init(struct ufs_qcom_host *host)
 	attr->attr.mode = S_IRUGO | S_IWUSR;
 	if (device_create_file(host->hba->var->dev, attr))
 		dev_dbg(host->hba->dev, "Failed to create sysfs for pm_qos_latency_us\n");
+	else
+		host->pm_qos.latency_attr_created = true;
 
 	/* PM QoS enable sys-fs attribute */
 	attr = &host->pm_qos.enable_attr;
@@ -1976,8 +2006,8 @@ static int ufs_qcom_pm_qos_init(struct ufs_qcom_host *host)
 	attr->attr.mode = S_IRUGO | S_IWUSR;
 	if (device_create_file(host->hba->var->dev, attr))
 		dev_dbg(host->hba->dev, "Failed to create sysfs for pm_qos enable\n");
-
-	host->pm_qos.is_enabled = true;
+	else
+		host->pm_qos.enable_attr_created = true;
 
 	return 0;
 
@@ -1992,26 +2022,63 @@ static void ufs_qcom_pm_qos_suspend(struct ufs_qcom_host *host)
 {
 	int i;
 
-	if (!host->pm_qos.groups)
-		return;
-
-	for (i = 0; i < host->pm_qos.num_groups; i++)
-		flush_work(&host->pm_qos.groups[i].unvote_work);
+	mutex_lock(&host->pm_qos.lock);
+	if (host->pm_qos.initialized)
+		for (i = 0; i < host->pm_qos.num_groups; i++)
+			flush_work(&host->pm_qos.groups[i].unvote_work);
+	mutex_unlock(&host->pm_qos.lock);
 }
 
 static void ufs_qcom_pm_qos_remove(struct ufs_qcom_host *host)
 {
+	struct ufs_qcom_pm_qos_cpu_group *groups;
+	unsigned long flags;
 	int i;
 
-	if (!host->pm_qos.groups)
-		return;
+	/* Do not hold locks needed by a sysfs callback while removing it. */
+	if (host->pm_qos.enable_attr_created) {
+		device_remove_file(host->hba->var->dev, &host->pm_qos.enable_attr);
+		host->pm_qos.enable_attr_created = false;
+	}
+	if (host->pm_qos.latency_attr_created) {
+		device_remove_file(host->hba->var->dev, &host->pm_qos.latency_attr);
+		host->pm_qos.latency_attr_created = false;
+	}
 
-	for (i = 0; i < host->pm_qos.num_groups; i++)
-		pm_qos_remove_request(&host->pm_qos.groups[i].req);
-	destroy_workqueue(host->pm_qos.workq);
-
-	kfree(host->pm_qos.groups);
+	mutex_lock(&host->pm_qos.lock);
+	spin_lock_irqsave(host->hba->host->host_lock, flags);
+	if (!host->pm_qos.initialized) {
+		spin_unlock_irqrestore(host->hba->host->host_lock, flags);
+		goto out;
+	}
+	/* Close request producers and detach from locked debugfs readers. */
+	host->pm_qos.initialized = false;
+	host->pm_qos.is_enabled = false;
+	groups = host->pm_qos.groups;
 	host->pm_qos.groups = NULL;
+	spin_unlock_irqrestore(host->hba->host->host_lock, flags);
+
+	/* Workers may still be updating requests; drain before removing them. */
+	destroy_workqueue(host->pm_qos.workq);
+	host->pm_qos.workq = NULL;
+	for (i = 0; i < host->pm_qos.num_groups; i++)
+		pm_qos_remove_request(&groups[i].req);
+	kfree(groups);
+out:
+	mutex_unlock(&host->pm_qos.lock);
+}
+#else
+static int ufs_qcom_pm_qos_init(struct ufs_qcom_host *host)
+{
+	return -ENOTSUPP;
+}
+
+static void ufs_qcom_pm_qos_suspend(struct ufs_qcom_host *host)
+{
+}
+
+static void ufs_qcom_pm_qos_remove(struct ufs_qcom_host *host)
+{
 }
 #endif /* CONFIG_SMP */
 
@@ -2136,6 +2203,7 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	/* Make a two way bind between the qcom host and the hba */
 	host->hba = hba;
 	spin_lock_init(&host->ice_work_lock);
+	mutex_init(&host->pm_qos.lock);
 
 	ufshcd_set_variant(hba, host);
 
@@ -2179,7 +2247,7 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	} else if (IS_ERR(host->generic_phy)) {
 		err = PTR_ERR(host->generic_phy);
 		dev_err(dev, "%s: PHY get failed %d\n", __func__, err);
-		goto out;
+		goto out_host_free;
 	}
 
 	err = ufs_qcom_pm_qos_init(host);
@@ -2276,8 +2344,9 @@ out_disable_phy:
 	phy_power_off(host->generic_phy);
 out_unregister_bus:
 	phy_exit(host->generic_phy);
-	msm_bus_scale_unregister_client(host->bus_vote.client_handle);
+	ufs_qcom_bus_unregister(host);
 out_host_free:
+	ufs_qcom_pm_qos_remove(host);
 	devm_kfree(dev, host);
 	ufshcd_set_variant(hba, NULL);
 out:
@@ -2288,7 +2357,7 @@ static void ufs_qcom_exit(struct ufs_hba *hba)
 {
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 
-	msm_bus_scale_unregister_client(host->bus_vote.client_handle);
+	ufs_qcom_bus_unregister(host);
 	ufs_qcom_disable_lane_clks(host);
 	phy_power_off(host->generic_phy);
 	ufs_qcom_pm_qos_remove(host);
@@ -2743,8 +2812,10 @@ static struct ufs_hba_crypto_variant_ops ufs_hba_crypto_variant_ops = {
 };
 
 static struct ufs_hba_pm_qos_variant_ops ufs_hba_pm_qos_variant_ops = {
+#ifdef CONFIG_SMP
 	.req_start	= ufs_qcom_pm_qos_req_start,
 	.req_end	= ufs_qcom_pm_qos_req_end,
+#endif
 };
 
 static struct ufs_hba_variant ufs_hba_qcom_variant = {

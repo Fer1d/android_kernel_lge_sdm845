@@ -16,6 +16,7 @@
 
 #include <linux/phy/phy.h>
 #include <linux/pm_qos.h>
+#include <linux/mutex.h>
 #include "ufshcd.h"
 
 #define MAX_UFS_QCOM_HOSTS	2
@@ -217,6 +218,7 @@ struct ufs_qcom_bus_vote {
 	int max_bw_vote;
 	int saved_vote;
 	bool is_max_bw_needed;
+	bool max_bus_bw_created;
 	struct device_attribute max_bus_bw;
 };
 
@@ -306,6 +308,10 @@ struct ufs_qcom_pm_qos_cpu_group {
  * @num_clusters: number of clusters defined
  * @default_cpu: cpu to use for voting for request not specifying a cpu
  * @is_enabled: flag specifying whether voting logic is enabled
+ * @initialized: all groups, requests and the workqueue are ready
+ * @lock: serialize sleeping sysfs/suspend users against teardown
+ * @latency_attr_created: latency sysfs attribute was published
+ * @enable_attr_created: enable sysfs attribute was published
  */
 struct ufs_qcom_pm_qos {
 	struct ufs_qcom_pm_qos_cpu_group *groups;
@@ -315,6 +321,10 @@ struct ufs_qcom_pm_qos {
 	int num_groups;
 	int default_cpu;
 	bool is_enabled;
+	bool initialized;
+	struct mutex lock;
+	bool latency_attr_created;
+	bool enable_attr_created;
 };
 
 struct ufs_qcom_host {
