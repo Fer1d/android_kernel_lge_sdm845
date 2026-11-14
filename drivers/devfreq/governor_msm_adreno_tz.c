@@ -464,6 +464,7 @@ static int tz_start(struct devfreq *devfreq)
 	unsigned int tz_pwrlevels[MSM_ADRENO_MAX_PWRLEVELS + 1];
 	int i, out, ret;
 	unsigned int version;
+	void *orig_data = devfreq->data;
 
 	struct msm_adreno_extended_profile *gpu_profile = container_of(
 					(devfreq->profile),
@@ -477,8 +478,7 @@ static int tz_start(struct devfreq *devfreq)
 	 * from the container of the device profile
 	 */
 	devfreq->data = gpu_profile->private_data;
-	partner_gpu_profile = gpu_profile;
-
+	/* Publish partner state only after START has completed. */
 	priv = devfreq->data;
 	priv->nb.notifier_call = tz_notify;
 
@@ -489,7 +489,8 @@ static int tz_start(struct devfreq *devfreq)
 		tz_pwrlevels[0] = i;
 	} else {
 		pr_err(TAG "tz_pwrlevels[] is too short\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_data;
 	}
 
 	INIT_WORK(&gpu_profile->partner_start_event_ws,
@@ -505,13 +506,30 @@ static int tz_start(struct devfreq *devfreq)
 				sizeof(version));
 	if (ret != 0 || version > MAX_TZ_VERSION) {
 		pr_err(TAG "tz_init failed\n");
-		return ret;
+		if (!ret)
+			ret = -EINVAL;
+		goto err_data;
 	}
 
-	for (i = 0; adreno_tz_attr_list[i] != NULL; i++)
-		device_create_file(&devfreq->dev, adreno_tz_attr_list[i]);
+	for (i = 0; adreno_tz_attr_list[i] != NULL; i++) {
+		ret = device_create_file(&devfreq->dev, adreno_tz_attr_list[i]);
+		if (ret)
+			goto err_files;
+	}
 
-	return kgsl_devfreq_add_notifier(devfreq->dev.parent, &priv->nb);
+	ret = kgsl_devfreq_add_notifier(devfreq->dev.parent, &priv->nb);
+	if (ret)
+		goto err_files;
+
+	partner_gpu_profile = gpu_profile;
+	return 0;
+
+err_files:
+	while (i--)
+		device_remove_file(&devfreq->dev, adreno_tz_attr_list[i]);
+err_data:
+	devfreq->data = orig_data;
+	return ret;
 }
 
 static int tz_stop(struct devfreq *devfreq)
@@ -556,6 +574,8 @@ static int tz_handler(struct devfreq *devfreq, unsigned int event, void *data)
 	switch (event) {
 	case DEVFREQ_GOV_START:
 		result = tz_start(devfreq);
+		if (result)
+			return result;
 		break;
 
 	case DEVFREQ_GOV_STOP:

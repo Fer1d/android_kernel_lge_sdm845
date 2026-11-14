@@ -95,6 +95,7 @@ static struct attribute_group dev_attr_group = {
 static int userspace_init(struct devfreq *devfreq)
 {
 	int err = 0;
+	void *orig_data = devfreq->data;
 	struct userspace_data *data = kzalloc(sizeof(struct userspace_data),
 					      GFP_KERNEL);
 
@@ -106,6 +107,10 @@ static int userspace_init(struct devfreq *devfreq)
 	devfreq->data = data;
 
 	err = sysfs_create_group(&devfreq->dev.kobj, &dev_attr_group);
+	if (err) {
+		devfreq->data = orig_data;
+		kfree(data);
+	}
 out:
 	return err;
 }

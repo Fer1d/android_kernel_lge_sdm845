@@ -154,6 +154,7 @@ static int gpubw_start(struct devfreq *devfreq)
 					struct msm_busmon_extended_profile,
 					profile);
 	unsigned int t1, t2 = 2 * HIST;
+	void *orig_data = devfreq->data;
 	int i, bus_size;
 
 
@@ -166,8 +167,19 @@ static int gpubw_start(struct devfreq *devfreq)
 	priv->bus.p_up = kzalloc(bus_size, GFP_KERNEL);
 	priv->bus.p_down = kzalloc(bus_size, GFP_KERNEL);
 	if (priv->bus.up == NULL || priv->bus.down == NULL ||
-		priv->bus.p_up == NULL || priv->bus.p_down == NULL)
+		priv->bus.p_up == NULL || priv->bus.p_down == NULL) {
+		/* A failed START must unwind without a subsequent STOP. */
+		kfree(priv->bus.up);
+		kfree(priv->bus.down);
+		kfree(priv->bus.p_up);
+		kfree(priv->bus.p_down);
+		priv->bus.up = NULL;
+		priv->bus.down = NULL;
+		priv->bus.p_up = NULL;
+		priv->bus.p_down = NULL;
+		devfreq->data = orig_data;
 		return -ENOMEM;
+	}
 
 	/* Set up the cut-over percentages for the bus calculation. */
 	for (i = 0; i < priv->bus.num; i++) {

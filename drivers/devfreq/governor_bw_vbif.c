@@ -89,6 +89,10 @@ static int devfreq_vbif_ev_handler(struct devfreq *devfreq,
 		ret = devfreq_vbif_update_bw(0, 0);
 		if (ret) {
 			pr_err("Unable to update BW! Gov start failed!\n");
+			mutex_lock(&df_lock);
+			df = NULL;
+			dev_ab = NULL;
+			mutex_unlock(&df_lock);
 			return ret;
 		}
 		/*

@@ -507,6 +507,8 @@ static int devfreq_cpufreq_gov_start(struct devfreq *devfreq)
 
 update_fail:
 	devfreq->data = node->orig_data;
+	node->df = NULL;
+	node->orig_data = NULL;
 	if (alloc) {
 		list_del(&node->list);
 		kfree(node);
