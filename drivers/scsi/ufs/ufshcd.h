@@ -887,6 +887,17 @@ struct ufs_hba {
 	struct mutex uic_cmd_mutex;
 	struct completion *uic_async_done;
 
+	/* host_lock protects lifecycle, pending events and sticky INIT failure. */
+	enum { UFSHCD_INIT, UFSHCD_LIVE, UFSHCD_STOPPING } init_lifecycle;
+#define UFSHCD_INIT_EH   (1U << 0)
+#define UFSHCD_INIT_EEH  (1U << 1)
+#define UFSHCD_INIT_RLS  (1U << 2)
+	unsigned int scan_pending;
+	bool init_scan_finished;
+	bool init_scan_ready;
+	bool init_failed;
+	bool init_irq_owned;
+	bool init_published;
 	u32 ufshcd_state;
 	u32 eh_flags;
 	u32 intr_mask;
