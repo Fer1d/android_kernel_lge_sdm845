@@ -140,6 +140,16 @@ out:
 	return ret;
 }
 
+static bool phandle_exists(const struct device_node *np,
+			   const char *phandle_name, int index)
+{
+	struct device_node *node = of_parse_phandle(np, phandle_name, index);
+	bool exists = node != NULL;
+
+	of_node_put(node);
+	return exists;
+}
+
 #define MAX_PROP_SIZE 32
 static int ufshcd_populate_vreg(struct device *dev, const char *name,
 		struct ufs_vreg **out_vreg)
@@ -156,7 +166,7 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 	}
 
 	snprintf(prop_name, MAX_PROP_SIZE, "%s-supply", name);
-	if (!of_parse_phandle(np, prop_name, 0)) {
+	if (!phandle_exists(np, prop_name, 0)) {
 		dev_info(dev, "%s: Unable to find %s regulator, assuming enabled\n",
 				__func__, prop_name);
 		goto out;
@@ -484,8 +494,6 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 		dev_err(dev, "Intialization failed\n");
 		goto dealloc_host;
 	}
-
-	platform_set_drvdata(pdev, hba);
 
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);

@@ -10799,6 +10799,9 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	struct Scsi_Host *host = hba->host;
 	struct device *dev = hba->dev;
 
+	/* Publish the HBA before registering callbacks that use drvdata. */
+	dev_set_drvdata(dev, hba);
+
 	if (!mmio_base) {
 		dev_err(hba->dev,
 		"Invalid memory reference for mmio_base is NULL\n");
@@ -11013,6 +11016,7 @@ out_disable:
 	hba->is_irq_enabled = false;
 	ufshcd_hba_exit(hba);
 out_error:
+	dev_set_drvdata(dev, NULL);
 	return err;
 }
 EXPORT_SYMBOL_GPL(ufshcd_init);
