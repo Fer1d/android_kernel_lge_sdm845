@@ -509,17 +509,21 @@ static int devfreq_notifier_call(struct notifier_block *nb, unsigned long type,
  */
 static void _remove_devfreq(struct devfreq *devfreq)
 {
-	mutex_lock(&devfreq_list_lock);
-	list_del(&devfreq->node);
-	mutex_unlock(&devfreq_list_lock);
+	/* Failed adds were detached and never acquired profile ownership. */
+	if (devfreq->add_complete) {
+		mutex_lock(&devfreq_list_lock);
+		list_del_init(&devfreq->node);
+		mutex_unlock(&devfreq_list_lock);
 
-	if (devfreq->governor)
-		devfreq->governor->event_handler(devfreq,
+		if (devfreq->governor)
+			devfreq->governor->event_handler(devfreq,
 						 DEVFREQ_GOV_STOP, NULL);
 
-	if (devfreq->profile->exit)
-		devfreq->profile->exit(devfreq->dev.parent);
+		if (devfreq->profile->exit)
+			devfreq->profile->exit(devfreq->dev.parent);
+	}
 
+	srcu_cleanup_notifier_head(&devfreq->transition_notifier_list);
 	mutex_destroy(&devfreq->lock);
 	mutex_destroy(&devfreq->sysfs_lock);
 	kfree(devfreq);
@@ -529,7 +533,7 @@ static void _remove_devfreq(struct devfreq *devfreq)
  * devfreq_dev_release() - Callback for struct device to release the device.
  * @dev:	the devfreq device
  *
- * This calls _remove_devfreq() if _remove_devfreq() is not called.
+ * The device reference owns the allocation, including on add failure.
  */
 static void devfreq_dev_release(struct device *dev)
 {
@@ -598,12 +602,9 @@ struct devfreq *devfreq_add_device(struct device *dev,
 	}
 	devfreq_set_freq_limits(devfreq);
 
-	dev_set_name(&devfreq->dev, "%s", dev_name(dev));
-	err = device_register(&devfreq->dev);
-	if (err) {
-		mutex_unlock(&devfreq->lock);
-		goto err_dev;
-	}
+	/* Initialize device-managed resources before publishing sysfs. */
+	device_initialize(&devfreq->dev);
+	srcu_init_notifier_head(&devfreq->transition_notifier_list);
 
 	devfreq->trans_table =	devm_kzalloc(&devfreq->dev, sizeof(unsigned int) *
 						devfreq->profile->max_state *
@@ -613,10 +614,18 @@ struct devfreq *devfreq_add_device(struct device *dev,
 						devfreq->profile->max_state,
 						GFP_KERNEL);
 	devfreq->last_stat_updated = jiffies;
+	if (!devfreq->trans_table || !devfreq->time_in_state) {
+		err = -ENOMEM;
+		mutex_unlock(&devfreq->lock);
+		goto err_put;
+	}
 
-	srcu_init_notifier_head(&devfreq->transition_notifier_list);
-
+	err = dev_set_name(&devfreq->dev, "%s", dev_name(dev));
+	if (!err)
+		err = device_add(&devfreq->dev);
 	mutex_unlock(&devfreq->lock);
+	if (err)
+		goto err_put;
 
 	mutex_lock(&devfreq_list_lock);
 	list_add(&devfreq->node, &devfreq_list);
@@ -637,18 +646,20 @@ struct devfreq *devfreq_add_device(struct device *dev,
 			__func__);
 		goto err_init;
 	}
+	devfreq->add_complete = true;
 	mutex_unlock(&devfreq_list_lock);
 
 	return devfreq;
 
 err_init:
-	list_del(&devfreq->node);
+	list_del_init(&devfreq->node);
+	/* START failures unwind their own partial governor state. */
+	devfreq->governor = NULL;
 	mutex_unlock(&devfreq_list_lock);
-
 	device_unregister(&devfreq->dev);
-err_dev:
-	if (devfreq)
-		kfree(devfreq);
+	return ERR_PTR(err);
+err_put:
+	put_device(&devfreq->dev);
 err_out:
 	return ERR_PTR(err);
 }

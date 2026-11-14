@@ -78,9 +78,9 @@ struct devfreq_dev_status {
  *			devfreq.last_status.
  * @get_cur_freq:	The device should provide the current frequency
  *			at which it is operating.
- * @exit:		An optional callback that is called when devfreq
- *			is removing the devfreq object due to error or
- *			from devfreq_remove_device() call. If the user
+ * @exit:		An optional callback called when a successfully added
+ *			devfreq object is released. On devfreq_add_device()
+ *			failure, cleanup remains the caller's responsibility. If the user
  *			has registered devfreq->nb at a notifier-head,
  *			this is the time to unregister it.
  * @freq_table:	Optional list of frequencies to support statistics.
@@ -116,6 +116,8 @@ struct devfreq_dev_profile {
  *                      to governors. Events include per device governor
  *                      init and exit, opp changes out of devfreq, suspend
  *                      and resume of per device devfreq during device idle.
+ *                      A failed START must unwind its own partial state;
+ *                      initial add failure does not send a subsequent STOP.
  *
  * Note that the callbacks are called with devfreq->lock locked by devfreq.
  */
@@ -139,6 +141,7 @@ struct devfreq_governor {
  * @profile:	device-specific devfreq profile
  * @governor:	method how to choose frequency based on the usage.
  * @governor_name:	devfreq governor name for use with this devfreq
+ * @add_complete:	Initial governor START succeeded; profile ownership transferred.
  * @nb:		notifier block used to notify devfreq object that it should
  *		reevaluate operable frequencies. Devfreq users may use
  *		devfreq.nb to the corresponding register notifier call chain.
@@ -172,6 +175,7 @@ struct devfreq {
 	struct devfreq_dev_profile *profile;
 	const struct devfreq_governor *governor;
 	char governor_name[DEVFREQ_NAME_LEN];
+	bool add_complete;
 	struct notifier_block nb;
 	struct delayed_work work;
 
