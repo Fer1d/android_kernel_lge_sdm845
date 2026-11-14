@@ -11170,12 +11170,14 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 							UFS_SLEEP_PWR_MODE,
 							UIC_LINK_HIBERN8_STATE);
 
-	/* Hold auto suspend until async scan completes */
-	err = pm_runtime_get_sync(dev);
-	if (err < 0) {
-		pm_runtime_put_noidle(dev);
-		goto out_remove_scsi_host;
-	}
+	/*
+	 * Hardware is already powered by the initialization above. Only hold a
+	 * usage reference for the async scan: platform callers enable runtime PM
+	 * after ufshcd_init() returns, so a runtime resume is not valid here.
+	 * Handoff failure drops this reference below; otherwise async scan owns
+	 * it (including the probe's success and failure puts).
+	 */
+	pm_runtime_get_noresume(dev);
 	err = 0;
 
 
