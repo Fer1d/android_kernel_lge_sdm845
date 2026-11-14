@@ -1174,6 +1174,18 @@ DECLARE_PER_CPU(struct sched_domain *, sd_llc);
 DECLARE_PER_CPU(int, sd_llc_size);
 DECLARE_PER_CPU(int, sd_llc_id);
 DECLARE_PER_CPU(struct sched_domain_shared *, sd_llc_shared);
+
+#ifdef CONFIG_SCHED_POC_SELECTOR
+extern struct static_key_false sched_poc_writer;
+void sched_poc_idle_update(int cpu, bool idle);
+static inline void sched_poc_idle(int cpu, bool idle)
+{
+	if (static_branch_unlikely(&sched_poc_writer))
+		sched_poc_idle_update(cpu, idle);
+}
+#else
+static inline void sched_poc_idle(int cpu, bool idle) { }
+#endif
 DECLARE_PER_CPU(struct sched_domain *, sd_numa);
 DECLARE_PER_CPU(struct sched_domain *, sd_asym);
 DECLARE_PER_CPU(struct sched_domain *, sd_ea);

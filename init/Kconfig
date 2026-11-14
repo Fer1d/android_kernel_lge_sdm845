@@ -1455,6 +1455,16 @@ config SCHED_AUTOGROUP
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
 
+config SCHED_POC_SELECTOR
+	bool "Piece-Of-Cake idle candidate experiment"
+	depends on SMP && 64BIT && SYSCTL && NR_CPUS <= 64
+	default n
+	help
+	  Fixed atomic64 idle bitmap selector derived from POC v2.6.3.
+	  Runtime mode defaults to 0 (off); 1 observes candidates and 2 enables
+	  restricted selection. WALT/EAS policy and fallback remain in charge.
+	  If unsure, say N.
+
 config SCHED_TUNE
 	bool "Boosting for CFS tasks (EXPERIMENTAL)"
 	depends on SMP

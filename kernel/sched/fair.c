@@ -6876,6 +6876,10 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
  */
+#ifdef CONFIG_SCHED_POC_SELECTOR
+#include "poc_selector.c"
+#endif
+
 static int select_idle_sibling(struct task_struct *p, int prev, int target)
 {
 	struct sched_domain *sd;
@@ -6887,6 +6891,14 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 
 	schedstat_inc(p->se.statistics.nr_wakeups_sis_attempts);
 	schedstat_inc(this_rq()->eas_stats.sis_attempts);
+
+#ifdef CONFIG_SCHED_POC_SELECTOR
+	/* Runtime off/shadow cannot change the legacy result. */
+	i = poc_legacy(p, target);
+	if (i >= 0)
+		return i;
+	i = task_cpu(p);
+#endif
 
 	if (!sysctl_sched_cstate_aware) {
 		if (idle_cpu(target)) {
@@ -7149,6 +7161,10 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 	do {
 		cpumask_t search_cpus;
 		bool do_rotate = false, avoid_prev_cpu = false;
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		int poc_hint = -1, poc_resume;
+		bool poc_trial = false;
+#endif
 
 		cpumask_copy(&search_cpus, tsk_cpus_allowed(p));
 		cpumask_and(&search_cpus, &search_cpus, sched_group_cpus(sg));
@@ -7157,14 +7173,46 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 		if (do_rotate)
 			fbt_env->avoid_prev_cpu = avoid_prev_cpu;
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		/* Only the existing prefer_idle case, in this group. Rotation,
+		 * avoid-prev and every special policy use the unmodified scan.
+		 */
+		if (prefer_idle && !do_rotate && !avoid_prev_cpu &&
+		    !fbt_env->need_idle && !fbt_env->placement_boost &&
+		    !fbt_env->rtg_target && !boosted)
+			poc_hint = poc_candidate(p, cpu, &search_cpus, true);
+		poc_resume = i;
+#endif
 retry:
+#ifdef CONFIG_SCHED_POC_SELECTOR
+		/* Process the hint through the SAME common checks and Case A.1.
+		 * continue restores the original cursor; a failed hint cannot
+		 * skip lower CPU IDs. A rejected hint is still visited by the old scan.
+		 */
+		for (; (i = poc_hint >= 0 ?
+			     (poc_trial = true, poc_hint) :
+			     cpumask_next(i, &search_cpus)) < nr_cpu_ids;
+		     i = poc_trial ? poc_resume : i, poc_trial = false) {
+#else
 		while ((i = cpumask_next(i, &search_cpus)) < nr_cpu_ids) {
+#endif
 			unsigned long capacity_curr = capacity_curr_of(i);
 			unsigned long capacity_orig = capacity_orig_of(i);
 			unsigned long wake_util, new_util, min_capped_util;
 			unsigned long raw_util;
 
-			cpumask_clear_cpu(i, &search_cpus);
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			poc_hint = -1;
+			if (poc_trial && !poc_candidate_valid(p, i, cpu,
+							 sched_group_cpus(sg))) {
+				poc_count(POC_REJECTED);
+				continue;
+			}
+#endif
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			if (!poc_trial)
+#endif
+				cpumask_clear_cpu(i, &search_cpus);
 
 			trace_sched_cpu_util(i);
 			if (!cpu_online(i) || cpu_isolated(i))
@@ -7188,7 +7236,11 @@ retry:
 			new_util = raw_util;
 			spare_cap = capacity_orig_of(i) - wake_util;
 
-			if (spare_cap > most_spare_cap &&
+			if (
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			    !poc_trial &&
+#endif
+			    spare_cap > most_spare_cap &&
 			    (!task_uclamp_active(p) || task_fits_max(p, i))) {
 				most_spare_cap = spare_cap;
 				most_spare_cap_cpu = i;
@@ -7243,6 +7295,11 @@ retry:
 			 * represent an optimal choice for latency sensitive
 			 * tasks.
 			 */
+#ifdef CONFIG_SCHED_POC_SELECTOR
+			/* A hint that lost idle status must not enter active ranking. */
+			if (poc_trial && !idle_cpu(i))
+				continue;
+#endif
 			if (prefer_idle) {
 
 				/*
@@ -7250,6 +7307,10 @@ retry:
 				 * Return the first IDLE CPU we find.
 				 */
 				if (idle_cpu(i)) {
+#ifdef CONFIG_SCHED_POC_SELECTOR
+					if (poc_trial)
+						poc_count(POC_EAS_SELECTED);
+#endif
 					schedstat_inc(p->se.statistics.nr_wakeups_fbt_pref_idle);
 					schedstat_inc(this_rq()->eas_stats.fbt_pref_idle);
 
@@ -7262,6 +7323,13 @@ retry:
 					return i;
 				}
 
+#ifdef CONFIG_SCHED_POC_SELECTOR
+				/* It may have ceased being idle since the trial check.
+				 * Never let a hint perturb active candidate ranking.
+				 */
+				if (poc_trial)
+					continue;
+#endif
 				/*
 				 * Case A.2: Target ACTIVE CPU
 				 * Favor CPUs with max spare capacity.

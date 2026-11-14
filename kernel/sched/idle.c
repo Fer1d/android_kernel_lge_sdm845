@@ -220,12 +220,14 @@ static void cpu_idle_loop(void)
 		__current_set_polling();
 		quiet_vmstat();
 		tick_nohz_idle_enter();
+		sched_poc_idle(cpu, true);
 
 		while (!need_resched()) {
 			check_pgt_cache();
 			rmb();
 
 			if (cpu_is_offline(cpu)) {
+				sched_poc_idle(cpu, false);
 				cpuhp_report_idle_dead();
 				arch_cpu_idle_dead();
 			}
@@ -258,6 +260,7 @@ static void cpu_idle_loop(void)
 		 * This is required because for polling idle loops we will
 		 * not have had an IPI to fold the state for us.
 		 */
+		sched_poc_idle(cpu, false);
 		preempt_set_need_resched();
 		tick_nohz_idle_exit();
 		__current_clr_polling();
