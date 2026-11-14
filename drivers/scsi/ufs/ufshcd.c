@@ -10176,7 +10176,7 @@ ufshcd_init_latency_hist(struct ufs_hba *hba)
 static void
 ufshcd_exit_latency_hist(struct ufs_hba *hba)
 {
-	device_create_file(hba->dev, &dev_attr_latency_hist);
+	device_remove_file(hba->dev, &dev_attr_latency_hist);
 }
 
 /**
@@ -10199,8 +10199,6 @@ void ufshcd_remove(struct ufs_hba *hba)
 		if (hba->devfreq)
 			devfreq_remove_device(hba->devfreq);
 	}
-
-	ufshcd_exit_latency_hist(hba);
 
 	ufshcd_hba_exit(hba);
 	ufsdbg_remove_debugfs(hba);
@@ -11011,7 +11009,6 @@ out_remove_scsi_host:
 	scsi_remove_host(hba->host);
 exit_gating:
 	ufshcd_exit_clk_gating(hba);
-	ufshcd_exit_latency_hist(hba);
 out_disable:
 	hba->is_irq_enabled = false;
 	ufshcd_hba_exit(hba);
