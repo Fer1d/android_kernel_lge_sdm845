@@ -2694,5 +2694,18 @@ extern struct reclaim_param reclaim_task_anon(struct task_struct *task,
 extern void *kvmalloc(size_t size, gfp_t flags);
 extern void *kvzalloc(size_t size, gfp_t flags);
 
+/* Match kmalloc_array(): reject overflow before calling the allocator. */
+static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
+{
+	if (size != 0 && n > SIZE_MAX / size)
+		return NULL;
+	return kvmalloc(n * size, flags);
+}
+
+static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
+{
+	return kvmalloc_array(n, size, flags | __GFP_ZERO);
+}
+
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */

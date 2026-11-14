@@ -714,32 +714,48 @@ out:
 }
 
 /**
- * kvmalloc - allocate memory, try kmalloc first, fallback to vmalloc
+ * kvmalloc - try kmalloc first, then fall back to vmalloc
  * @size: size of the memory to allocate
- * @flags: gfp mask
+ * @flags: gfp mask; vmalloc fallback requires a superset of GFP_KERNEL
  *
- * Return: pointer to the allocated memory of @size bytes or %NULL if
- * we are out of memory. kmalloc is used first, as it performs better
- * for small objects. If the allocation fails, vmalloc is used.
+ * Requests not compatible with GFP_KERNEL use kmalloc only. Requests of at
+ * most PAGE_SIZE do not fall back to vmalloc. Use kvfree() to free the result.
+ *
+ * Reclaim modifiers __GFP_NORETRY and __GFP_NOFAIL are not supported for
+ * vmalloc fallback. __GFP_REPEAT prefers kmalloc only for costly allocations
+ * (size > PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER); smaller requests must use
+ * __GFP_NORETRY to avoid disruptive reclaim before falling back.
+ *
+ * Return: allocated memory or %NULL on failure; zero size follows kmalloc().
  */
 void *kvmalloc(size_t size, gfp_t flags)
 {
+	gfp_t kmalloc_flags = flags;
 	void *ret;
 
-	ret = kmalloc(size, flags | __GFP_NOWARN);
-	if (!ret)
-		ret = __vmalloc(size, flags, PAGE_KERNEL);
-	return ret;
+	/* vmalloc uses GFP_KERNEL for some internal allocations. */
+	if ((flags & GFP_KERNEL) != GFP_KERNEL)
+		return kmalloc(size, flags);
+
+	if (size > PAGE_SIZE) {
+		kmalloc_flags |= __GFP_NOWARN;
+
+		/* 4.9 ignores __GFP_REPEAT for non-costly orders. */
+		if (!(kmalloc_flags & __GFP_REPEAT) ||
+				(size <= PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER))
+			kmalloc_flags |= __GFP_NORETRY;
+	}
+
+	ret = kmalloc(size, kmalloc_flags);
+	if (ret || size <= PAGE_SIZE)
+		return ret;
+
+	return __vmalloc(size, flags, PAGE_KERNEL);
 }
 EXPORT_SYMBOL(kvmalloc);
 
 void *kvzalloc(size_t size, gfp_t flags)
 {
-	void *ret;
-
-	ret = kzalloc(size, flags | __GFP_NOWARN);
-	if (!ret)
-		ret = __vmalloc(size, flags | __GFP_ZERO, PAGE_KERNEL);
-	return ret;
+	return kvmalloc(size, flags | __GFP_ZERO);
 }
 EXPORT_SYMBOL(kvzalloc);

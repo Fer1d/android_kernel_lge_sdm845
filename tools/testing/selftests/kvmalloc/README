@@ -1,0 +1,93 @@
+kvmalloc stage-1 host contract selftest
+======================================
+
+Run from any directory:
+  python3 -I /home/ssx/android-kernel/tools/testing/selftests/kvmalloc/run.py
+Or use python3 -I with the absolute path of run.py in another checkout.
+Requires Python 3 and a host C compiler with ASan/UBSan (CC may override cc).
+No kernel build, device, root, fetch, or network is needed. Generated C and
+binaries live in an automatically removed temporary directory.
+
+run.py extracts the CURRENT C definitions of kvmalloc, kvzalloc, kvfree from
+mm/util.c and kvmalloc_array/kvcalloc from include/linux/mm.h. It also extracts
+GFP constants/dependencies and PAGE_ALLOC_COSTLY_ORDER from this checkout.
+It fails on missing/nonunique definitions or duplicate helpers in slab.h.
+The bodies are not reimplemented in the test. test.c supplies deterministic
+kmalloc/__vmalloc/free stubs and checks arguments, results and ownership.
+
+Normal and ASan+UBSan runs cover simulated 4 KiB and 64 KiB PAGE_SIZE:
+- zero, subpage, page, page+1, costly threshold and threshold+1 requests;
+- GFP_KERNEL, ACCOUNT, ZERO, REPEAT, NOWARN and incompatible NOFS/NOIO,
+  ATOMIC/NOWAIT/zero masks, including all success/failure combinations;
+- kmalloc fast-fail flags versus unchanged vmalloc flags;
+- kvzalloc/kvcalloc zeroing on both backends, and nonzero fill for kvmalloc;
+- overflowing products rejected before either backend, maximum valid products
+  forwarded without wrap, zero dimensions, array allocation and failure;
+- unchanged kvfree routing for both backends, NULL and ZERO_SIZE_PTR.
+Sanitizer errors, leaks, assertions and compiler warnings fail the run.
+
+Limits
+------
+This is extracted-function host testing, not kernel-header compilation, KUnit,
+boot testing, allocator stress or evidence of performance improvement. Page
+size is simulated. It does NOT exercise actual reclaim, compaction, OOM,
+memcg, NUMA, vmalloc page tables, concurrency, fault injection infrastructure,
+or real failure warnings. ASan tests only the host harness. NOFAIL/NORETRY
+are not supported caller contracts for fallback; no local global-helper
+caller was found requesting them. GFP_KERNEL-superset is the upstream reclaim
+compatibility test, not a guarantee for arbitrary zone/contiguity modifiers.
+No NUMA helper API, HIGHMEM policy or vmalloc implementation is backported.
+
+Source/equivalence audit (local git objects only, no fetch)
+--------------------------------------------------------
+Baseline HEAD: 0943f923a568938a85d40452df4ac36aa7e02fb6.
+Local global helpers were introduced by 9d3f977c86f4 (Sony performance squash),
+not by BakaSU. They unconditionally fell back after kmalloc/kzalloc failure.
+
+rangga-sdm845/BakaSU-SUSFS:
+  ff9e458bb6e842e32bb651da4c061d5f1f00841b
+  No global helpers in mm/util.c or mm.h/slab.h. F2FS-private kvmalloc in
+  fs/f2fs/f2fs.h, introduced by 357eb774b25e, only suppresses kmalloc warnings
+  and prevents <=PAGE_SIZE fallback. It lacks fast-fail and GFP compatibility.
+
+sm8250-mod/lunar-release:
+  b13875fe8d80a133048954e7459931c54eb46929
+  mm/util.c implements kvmalloc_node; mm.h wraps it and defines array helpers.
+  Its __GFP_RETRY_MAYFAIL policy cannot be copied literally to this 4.9 tree.
+
+Adapted source policies, verified with git show/log:
+  a7c3e901a46f: original kv[mz]alloc helpers and <=PAGE_SIZE boundary.
+  6c5ab6511f71: 4.9-style REPEAT/NORETRY costly-order policy (used here).
+  ce91f6ee5b3b: GFP_KERNEL-incompatible requests use kmalloc only (used here).
+  3b3b1a29eb89: array overflow check conversion in lunar. This patch uses
+                the preceding division guard, matching local kmalloc_array;
+                equivalent for size_t, without new include dependencies.
+  1c542f38ab8d: kvcalloc wrapper policy; ZERO is passed through kvmalloc_array.
+Existing global exported kvmalloc/kvzalloc ABI and kvfree are retained.
+include/linux/slab.h is audited/backed up but intentionally unchanged.
+
+Local callers/flags audit
+------------------------
+All direct global-helper callsites in mm/swap_state.c, swapfile.c,
+swap_slots.c, crypto/lzo-rle.c, drivers/block/zram/zram_drv.c,
+net/xfrm/xfrm_compat.c and fs/f2fs/extm.c use GFP_KERNEL, optionally ZERO.
+F2FS wrappers in f2fs.h pass flags through. All f2fs_kvmalloc/kvzalloc callers
+in file.c, node.c and segment.c use GFP_KERNEL. f2fs_kmalloc/kzalloc callers
+also use GFP_NOFS and GFP_F2FS_ZERO (= NOFS | ZERO) in acl.c, data.c,
+inline.c and xattr.c. Those must now remain kmalloc-only on failure; ENOMEM
+paths already exist. The wrapper's initial kmalloc and existing free-site
+contracts are not rewritten by this patch (large GFP_KERNEL fallback in that
+kmalloc-named wrapper remains an independent pre-existing audit concern).
+
+WireGuard compat.h shadows both names on 4.9 with its own static helpers;
+peerlookup, ratelimiter and compat ptr_ring therefore do not use the changed
+global body. queueing.c supplies GFP_KERNEL to its ptr_ring. Its private
+fallback lacks the global GFP guard and is explicitly outside this patch.
+KernelSU kernel_compat.c's __kvmalloc uses a separate <4.12 branch on 4.9;
+its global call is in the inactive >=4.12 branch. sepolicy uses GFP_KERNEL.
+AppArmor, ext4, KVM and ceph similarly named helpers are distinct APIs, not
+calls to these global definitions. No existing kvmalloc_array/kvcalloc
+function definition was found in the local tree before adding these helpers.
+
+Scope excludes all traditional LRU/shadow/unevictable policies, LZ4KDR,
+MGLRU switches, wholesale vmalloc changes, seq/BPF migrations and callers.
