@@ -444,6 +444,23 @@ config INET_DIAG_DESTROY
 	  had been disconnected.
 	  If unsure, say N.
 
+config TCP_PLB_DEFAULT_ENABLED
+	bool "TCP: enable Protective Load Balancing by default"
+	depends on INET
+	default n
+	---help---
+	  Set the initial value of the global net.ipv4.tcp_plb_enabled
+	  sysctl to 1. This does not control compilation of the PLB helpers
+	  or select a congestion control algorithm. The sysctl remains
+	  writable at runtime and is not isolated per network namespace.
+
+	  PLB needs a cooperating congestion control (currently BBRv3),
+	  usable ECN feedback, and a network that can use changed transmit
+	  hashes or IPv6 flow labels for path selection. It cannot guarantee
+	  a different path. All other PLB defaults remain unchanged.
+
+	  If unsure, say N.
+
 menuconfig TCP_CONG_ADVANCED
 	bool "TCP: advanced congestion control"
 	---help---

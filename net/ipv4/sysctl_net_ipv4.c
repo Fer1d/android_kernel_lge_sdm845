@@ -58,7 +58,7 @@ static int tcp_plb_max_cong_thresh = 256;
  */
 struct tcp_plb_net_context tcp_plb_global_ctx = {
 	.params = {
-		.sysctl_tcp_plb_enabled = 0,
+		.sysctl_tcp_plb_enabled = IS_ENABLED(CONFIG_TCP_PLB_DEFAULT_ENABLED),
 		.sysctl_tcp_plb_idle_rehash_rounds = 31,
 		.sysctl_tcp_plb_rehash_rounds = 31,
 		.sysctl_tcp_plb_suspend_rto_sec = 0,

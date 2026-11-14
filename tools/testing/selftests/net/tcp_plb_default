@@ -1,0 +1,119 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0
+"""Host-only PLB source/default test; no kernel build or live sysctls."""
+
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[4]
+
+
+def extract(pattern, text):
+    match = re.search(pattern, text, re.M | re.S)
+    if match is None:
+        raise AssertionError("Source pattern not found: " + pattern)
+    return match.group(0)
+
+
+def main():
+    kconfig = (ROOT / "net/ipv4/Kconfig").read_text()
+    option = extract(
+        r"^config TCP_PLB_DEFAULT_ENABLED\n.*?(?=^(?:menuconfig|config|if) )",
+        kconfig,
+    )
+    assert re.search(r'^\s*bool "', option, re.M)
+    assert re.search(r"^\s*depends on INET$", option, re.M)
+    assert re.search(r"^\s*default n$", option, re.M)
+    assert not re.search(r"^\s*(?:select|imply) ", option, re.M)
+    assert kconfig.index(option) < kconfig.index("if TCP_CONG_ADVANCED")
+    net_kconfig = (ROOT / "net/Kconfig").read_text()
+    extract(r'^if INET\n(?:(?!^endif).)*^source "net/ipv4/Kconfig"$',
+            net_kconfig)
+    makefile = (ROOT / "net/ipv4/Makefile").read_text()
+    obj_y = extract(r"^obj-y\s*[:+]?=.*?(?=\n\n)", makefile)
+    assert "tcp_plb.o" in obj_y
+    assert "CONFIG_TCP_PLB" not in makefile
+    print("ok 1 - bool default n, INET dependency, unconditional IPv4 PLB object")
+
+    header = (ROOT / "include/net/tcp.h").read_text()
+    declarations = "\n".join(
+        extract(r"^struct " + name + r" \{.*?^\};", header)
+        for name in ("tcp_plb_sysctl_params", "tcp_plb_net_context")
+    )
+    source = (ROOT / "net/ipv4/sysctl_net_ipv4.c").read_text()
+    initializer = extract(
+        r"^struct tcp_plb_net_context tcp_plb_global_ctx = \{.*?^\};", source
+    )
+    accessor = extract(
+        r"^static inline struct tcp_plb_net_context \*tcp_get_plb_ctx\(.*?^\}",
+        header,
+    )
+    sysctl = extract(r'\{\s*\.procname\s*= "tcp_plb_enabled",.*?\}', source)
+    for pattern in (
+        r"\.data\s*=\s*&tcp_plb_global_ctx.params.sysctl_tcp_plb_enabled,",
+        r"\.mode\s*=\s*0644,",
+        r"\.proc_handler\s*=\s*proc_dointvec_minmax,",
+        r"\.extra1\s*=\s*&zero,",
+        r"\.extra2\s*=\s*&one,",
+    ):
+        assert re.search(pattern, sysctl), pattern
+    print("ok 2 - runtime sysctl still writable, global and bounded to 0/1")
+
+    # Use real declarations, initializer, accessor and kconfig macros. Only
+    # generated/autoconf.h is supplied by the host test, never the build tree.
+    program = "\n".join((
+        '#include <linux/kconfig.h>',
+        declarations,
+        initializer,
+        'struct net { int unused; };',
+        accessor,
+        r'''
+int main(void)
+{
+    struct net first = { 0 }, second = { 0 };
+    struct tcp_plb_sysctl_params *p = &tcp_plb_global_ctx.params;
+
+    if (p->sysctl_tcp_plb_enabled != EXPECT_ENABLED ||
+        p->sysctl_tcp_plb_idle_rehash_rounds != 31 ||
+        p->sysctl_tcp_plb_rehash_rounds != 31 ||
+        p->sysctl_tcp_plb_suspend_rto_sec != 0 ||
+        p->sysctl_tcp_plb_cong_thresh != 256)
+        return 1;
+    if (tcp_get_plb_ctx(&first) != &tcp_plb_global_ctx ||
+        tcp_get_plb_ctx(&second) != &tcp_plb_global_ctx)
+        return 2;
+    p->sysctl_tcp_plb_enabled = !EXPECT_ENABLED;
+    return tcp_get_plb_ctx(&second)->params.sysctl_tcp_plb_enabled !=
+           !EXPECT_ENABLED;
+}
+''',
+    ))
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    with tempfile.TemporaryDirectory(prefix="tcp-plb-default-") as directory:
+        temp = Path(directory)
+        (temp / "generated").mkdir()
+        (temp / "test.c").write_text(program)
+        for enabled in (0, 1):
+            (temp / "generated/autoconf.h").write_text(
+                "#define CONFIG_TCP_PLB_DEFAULT_ENABLED 1\n" if enabled else "\n"
+            )
+            subprocess.run(compiler + [
+                "-std=gnu89", "-Wall", "-Wextra", "-Werror",
+                "-Wno-unused-parameter", "-I" + str(temp),
+                "-I" + str(ROOT / "include"),
+                "-DEXPECT_ENABLED=" + str(enabled),
+                str(temp / "test.c"), "-o", str(temp / "test"),
+            ], check=True)
+            subprocess.run([str(temp / "test")], check=True)
+            print("ok %d - real initializer config=%s: enabled=%d, unchanged "
+                  "thresholds, shared context, runtime override" %
+                  (3 + enabled, "y" if enabled else "unset", enabled))
+
+
+if __name__ == "__main__":
+    main()

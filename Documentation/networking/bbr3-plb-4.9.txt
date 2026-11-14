@@ -58,10 +58,28 @@ uapi rtnetlink.h      RTAX_FEATURE_ECN_LOW (+TCP_USEC_TS) feature bit.
 New sysctls (net.ipv4.*)
 ------------------------
 
-tcp_plb_enabled (0/1, default 0), tcp_plb_idle_rehash_rounds,
-tcp_plb_rehash_rounds, tcp_plb_suspend_rto_sec, tcp_plb_cong_thresh.
-PLB only repaths when tcp_plb_enabled=1 and a cong control asks for
-it (currently bbr3).
+tcp_plb_enabled (0/1, default 0 unless CONFIG_TCP_PLB_DEFAULT_ENABLED=y),
+tcp_plb_idle_rehash_rounds, tcp_plb_rehash_rounds,
+tcp_plb_suspend_rto_sec, tcp_plb_cong_thresh.
+PLB only requests rehashing when tcp_plb_enabled=1 and a congestion
+control asks for it (currently bbr3). The switch remains writable at
+runtime regardless of the build-time default. These sysctls share one
+tcp_plb_global_ctx across network namespaces; they are not per-netns.
+
+Enabling the switch does not change any thresholds: idle_rehash_rounds=31,
+rehash_rounds=31, suspend_rto_sec=0, cong_thresh=256 (scaled by 256).
+It does not enable ECN, select BBRv3, or guarantee useful congestion
+feedback. BBRv3's PLB congestion samples require usable negotiated ECN
+and CE feedback; without those, enabling PLB alone cannot make it repath.
+
+PLB calls sk_rethink_txhash(), not a route-installation operation. A
+changed transmit hash can affect local queue selection and, where IPv6
+automatic flow labels use it, the on-wire flow label. A network must
+actually hash on the changed fields and offer alternative paths for this
+to help. IPv4's on-wire five-tuple is not changed by this helper. A new
+hash/flow label does not guarantee another next hop, lower latency, or
+higher throughput, and rehashing can reorder packets. Cellular/Wi-Fi or
+single-path networks need not benefit.
 
 Kconfig
 -------
@@ -69,6 +87,22 @@ Kconfig
 CONFIG_TCP_CONG_BBR3 (tristate, default n) builds tcp_bbr3.o;
 tcp_plb.o is part of obj-y. "bbr3" also appears in the default
 congestion control choice (DEFAULT_BBR3).
+
+CONFIG_TCP_PLB_DEFAULT_ENABLED (bool, depends on INET, default n) only
+sets the initial enabled field of tcp_plb_global_ctx. It is independent
+of TCP_CONG_ADVANCED and TCP_CONG_BBR3, so built-in or modular BBRv3 can
+use the same runtime switch. With the option unset, the initial value
+remains 0. There is no separate PLB object compilation switch.
+
+Host-only regression test (Python 3 and a host C compiler required):
+
+  python3 -I tools/testing/selftests/net/tcp_plb_default
+
+The test checks source defaults and INET dependency wiring, then compiles
+and runs the actual extracted global initializer and context declarations
+with the tree's linux/kconfig.h for both unset and enabled configurations.
+It needs no device, root, network traffic, or kernel build. This is not an
+on-device ECN, rehashing, namespace-isolation, or performance test.
 
 Related RCU fix
 ---------------
