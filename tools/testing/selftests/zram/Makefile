@@ -7,3 +7,13 @@ include ../lib.mk
 
 clean:
 	$(RM) err.log
+
+# Deliberately separate from run_tests: these never invoke zram.sh or devices.
+PYTHON ?= python3
+HOSTCC ?= gcc
+.PHONY: host-test host-test-sanitize
+host-test:
+	HOSTCC="$(HOSTCC)" $(PYTHON) -I ./zram_writeback_host_test.py
+
+host-test-sanitize:
+	HOSTCC="$(HOSTCC)" $(PYTHON) -I ./zram_writeback_host_test.py --sanitize

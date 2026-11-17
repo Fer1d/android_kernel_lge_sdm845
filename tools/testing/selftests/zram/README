@@ -36,5 +36,47 @@ Commands required for testing:
  - swapoff
  - mkfs/ mkfs.ext4
 
+Host-only writeback regression tests
+-----------------------------------
+These targets are independent of the device-oriented run_tests target above:
+
+  make -C tools/testing/selftests/zram host-test
+  make -C tools/testing/selftests/zram host-test-sanitize
+
+Or run python3 -I tools/testing/selftests/zram/zram_writeback_host_test.py,
+adding --sanitize for AddressSanitizer/UndefinedBehaviorSanitizer. HOSTCC may
+select an existing host compiler (default gcc). No downloads, /dev access,
+sysfs writes, zram.sh, build.sh, or kernel build are invoked. Temporary files
+are created under the host temporary directory and cleaned on exit.
+
+The Python harness extracts the actual driver helpers on every run and reports
+their SHA256. C mocks only kernel contracts (locks, memory, BIOs, usercopy,
+clock/randomness, block device). It runs at simulated 4/16/64KiB PAGE_SIZE.
+Missing implementation is KSFT_SKIP (4), not a passing stand-alone model.
+
+Coverage retains the original six groups: reserve/refund units; flush errors,
+partial grants and signals; slot free/replacement/read/ABA invalidation; batch
+sizes 1/31/32/33/65 and backing gaps; legacy per-request installation bound;
+allocation fallback and all old cleanup regressions. Six new groups execute
+actual EXEC/STATUS/compat dispatch: independent request caps and exact counts,
+unsubmitted/single-count invalidations and concurrent installed-page freeing,
+error stages/first-cause precedence and retained partial effects, bytewise
+reserved/output validation and permissions, sampled status/stale/lifecycle
+cookie rollover, and native/compat partial copyout failure without refunds.
+Reusing an ID is tested as a new operation, not deduplication.
+
+Both real UAPI structs compile with -m32 and -m64, checking all member offsets,
+alignment, size and ioctl numbers (no 32-bit libc needed). Feature-off native
+and compat dispatch/fops compile and execute; feature-off shared engine runs
+all six old groups at every page size. Lifecycle helpers execute with scripted
+random cookies; source checks additionally cover initialization, backing
+setup/removal, accepted reset's early return, and device removal call sites.
+
+Limits: these are host simulations, not a kernel configuration build, real
+concurrency/lockdep/KCSAN test, live reset/removal, physical I/O fault injection,
+or deployment validation. 32-bit checks cover userspace ABI, not a 32-bit
+kernel; the existing slot-flag layout is not changed in this phase. Full
+kernel builds and device acceptance remain separate manual gates.
+
 For more information please refer:
 kernel-source-tree/Documentation/blockdev/zram.txt

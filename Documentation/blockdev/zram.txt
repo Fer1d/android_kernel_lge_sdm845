@@ -444,6 +444,133 @@ budget in next setting is user's job.
 If admin want to measure writeback count in a certain period, he could
 know it via /sys/block/zram0/bd_stat's 3rd column.
 
+= synchronous per-request writeback ioctl (optional)
+
+CONFIG_ZRAM_WRITEBACK_IOCTL depends on CONFIG_ZRAM_WRITEBACK and defaults to n.
+It adds ZRAM_IOC_WB_EXEC (_IOWR('Z', 0x20, struct zram_wb_exec)) and
+ZRAM_IOC_WB_STATUS (_IOWR('Z', 0x21, struct zram_wb_status)) on /dev/zramX.
+The definitions are in include/uapi/linux/zram.h. Version 1 has exactly 160-byte
+EXEC and 192-byte STATUS structures, using fixed-width fields and 8-byte-aligned
+64-bit values. Native and compat userspace have identical layouts and ioctl
+numbers; there are no embedded pointers. Both zram block-operation tables expose
+the same commands. CONFIG=n and unknown commands yield user-visible ENOTTY via
+the block layer; known numbers with wrong direction/encoded size yield EINVAL
+when enabled. No defconfig is enabled automatically.
+
+Both commands require CAP_SYS_ADMIN. EXEC additionally requires a descriptor
+opened for writing (otherwise EBADF); STATUS permits a read-only descriptor.
+Zero the entire structure and set size = sizeof(struct ...) and version = 1.
+All flags, reserved fields and output fields MUST be zero on input. A wrong size,
+nonzero forbidden byte, invalid mode or invalid input combination returns EINVAL;
+an unsupported version returns EPROTONOSUPPORT; copyin faults return EFAULT.
+These failures perform no writeback. STATUS accepts only size and version as
+nonzero inputs. Malformed input must not trigger a legacy-backend fallback.
+
+STATUS returns capability bits, kernel page_size, actual disksize_bytes (not a
+userspace configuration wish), nonzero instance cookie and generation, and
+INITIALIZED/BACKING/GLOBAL_LIMIT state bits. Its capability mask advertises EXEC,
+STATUS, FILTERED_IDLE and DUAL_LIMIT. The quota is sampled in 4KiB units; page
+statistics, including bd_count/reads/writes, are in kernel pages, while compressed
+and allocator memory use are bytes. Initialization, disk size and identity are
+protected against lifecycle changes by init_lock. Quota and statistics are
+individually sampled and can change during the call: there is no all-fields-
+coherent snapshot, no last-request result and no guarantee that state stays ready
+after the call. An uninitialized device still supports STATUS; lack of readiness
+is not evidence of an unsupported ioctl ABI.
+
+EXEC requires a nonzero request_id and the expected_instance/expected_generation
+returned by STATUS. The ID is returned unchanged for correlation only: there is
+no deduplication cache, ownership protocol or exactly-once guarantee. A repeated
+ID executes a new request. A mismatched instance/generation reports
+STOP_STALE/op_errno=-ESTALE without work. Matching identity but no initialized
+device or backing device reports STOP_NOT_READY/op_errno=-ENODEV. These are valid
+structured results (ioctl returns 0), including for a zero-budget request.
+
+Modes PAGE, HUGE, IDLE and FILTERED_IDLE preserve the corresponding sysfs selection
+rules. page_index is zero except in PAGE mode, where slot zero is valid; values
+above U32_MAX are rejected, and an index beyond current capacity reports EINVAL
+in the result. idle_count is 0..10 for FILTERED_IDLE, and zero for every other
+mode. FILTERED_IDLE still requires current IDLE and low-compression flags; count
+zero removes only the cumulative-count threshold, not these flags. Unlike the
+legacy sysfs parser, ioctl rejects rather than clamps a count greater than 10.
+
+max_attempt_pages bounds physical pages submitted by this call, including failed
+or partially completed BIOs and pages later invalidated. max_installed_pages
+bounds successful slot installations. Both use kernel pages, must be positive for
+work, and max_installed_pages must not exceed max_attempt_pages. If either is zero
+there is explicitly no work (STOP_NO_WORK/op_errno=0, no scan/allocation/I/O),
+subject to input, identity, readiness and page-index validation. In particular,
+zero does not mean unlimited; a zero attempt cap with a positive installation
+cap is invalid. Pending snapshots count against both bounds, so neither can be
+overshot by a batch. Request attempts are independent of the global quota; EXEC
+never enables/disables it, replaces it, silently refills it or turns it into a
+per-request quota. When globally enabled it still limits every physical attempt
+using the reservation/refund rules above. Disabled global limits do not disable
+the per-call limits. Exhaustion reports STOP_GLOBAL_LIMIT/op_errno=-EIO after any
+affordable partial batch, and is not silently retried.
+
+EXEC returns these request-local outputs:
+  scanned_pages     slots examined by the scan (including noncandidates), once
+                    per slot; the preselection recheck is not a second scan.
+  selected_pages    slots claimed UNDER_WB after the final selection check,
+                    including a selection whose snapshot read subsequently fails.
+  submitted_pages   physical pages passed to submit_bio_wait, not BIO count.
+  installed_pages   increments at each successful slot installation under the
+                    slot lock; never a difference of global bd_count samples.
+                    A later free of an installed page does not reduce this count.
+  invalidated_pages selected slots whose allocation/UNDER_WB/IDLE identity guard
+                    fails when finalized, counted once, before clearing flags.
+                    Includes invalidated unsubmitted snapshots. Read/IO/signal/
+                    budget cancellation alone does not count as invalidation.
+  duration_ns       elapsed monotonic time from after input validation through
+                    execution and cleanup, including lock waits but not copyout.
+  stop_reason       COMPLETE, NO_WORK, ATTEMPT_LIMIT, INSTALLED_LIMIT,
+                    GLOBAL_LIMIT, BACKING_FULL, INTERRUPTED, ERROR, STALE or
+                    NOT_READY (STOP_NONE is only the zero input value).
+  op_errno          zero or negative errno; never a positive errno.
+  error_stage       NONE, ALLOC, SNAPSHOT_READ, BIO_BUILD or IO, distinguishing
+                    otherwise identical errno results. Non-error stop causes
+                    and lifecycle/validation-result errors use NONE.
+
+COMPLETE means the scan ended, not that a nonzero installation goal was reached.
+When both per-call caps are reached, INSTALLED_LIMIT takes precedence. Real
+errors/signals/global exhaustion take precedence over ordinary cap/end-of-scan
+reasons, and cleanup does not overwrite the first error, stage or stop cause.
+An IO error is preserved if a signal is also noticed after the same BIO. A
+signal is reported as op_errno=-EINTR, never a restartable syscall result.
+
+All structurally valid EXECs return ioctl 0 after copying their result, even if
+op_errno records stale/not-ready, ENOSPC, ENOMEM, EIO, EINTR or another operation
+error. Callers must inspect BOTH syscall return and op_errno. Errors may follow
+physical writes or successful earlier batches; they do not roll back those
+effects. A copyout failure returns syscall EFAULT even after effects and may
+leave only a prefix of the result in userspace. Submitted quota stays consumed;
+there is no refund, internal restart or result recovery API. The caller must not
+automatically replay EXEC or fall back to sysfs after EFAULT or any other EXEC
+failure. STATUS cannot resolve whether a particular request installed pages.
+
+The engine is shared with legacy sysfs, uses the existing synchronous 32-page
+aggregation and init_lock -> wb_mutex -> slot/wb_limit_lock order, and preserves
+the UNDER_WB/IDLE invalidation protocol. There is no new worker, parallel BIO,
+slot-owner system, or sleeping lock in slot-free notification. Old sysfs parsing,
+selection, unlimited-attempt behavior, returns and global-limit behavior remain.
+
+A new device has a random nonzero instance cookie and generation 1, stored outside
+resettable statistics. Successful backing setup/removal, disk initialization and
+accepted reset/removal advance generation under exclusive init_lock. Accepted
+reset advances it even on the uninitialized early return (whose legacy backing
+cleanup behavior is unchanged). Rejected lifecycle operations do not advance it;
+normal stats updates and quota setters do not advance it. An operation may cause
+more than one increment (for example reset also removes a backing device); use
+equality, not an expected increment. Generation wrap creates a different random
+nonzero instance cookie and starts at generation 1; device ID reuse also obtains
+a new random cookie. Tokens are lifecycle guards, not security credentials or
+per-slot versions. Exclusive reset waits for the synchronous engine to finish.
+
+Host-only actual-source regression targets and their simulation limits are
+listed in tools/testing/selftests/zram/README. Passing them is not a full kernel
+build, real compat syscall/device test or deployment acceptance.
+
 = memory tracking
 
 With CONFIG_ZRAM_MEMORY_TRACKING, user can know information of the

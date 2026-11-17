@@ -88,6 +88,16 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
+config ZRAM_WRITEBACK_IOCTL
+	bool "Synchronous per-request zram writeback ioctl"
+	depends on ZRAM_WRITEBACK
+	default n
+	help
+	  Add versioned EXEC and STATUS ioctls on /dev/zramX. EXEC has
+	  independent per-call attempt and installation limits and still
+	  respects the existing device writeback quota. Requires CAP_SYS_ADMIN.
+	  The existing sysfs interface is unchanged. If unsure, say N.
+
 config ZRAM_MEMORY_TRACKING
 	bool "Track zRam block status"
 	depends on ZRAM && DEBUG_FS

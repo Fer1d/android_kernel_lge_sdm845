@@ -133,6 +133,11 @@ struct zram {
 	unsigned long limit_pages;
 
 	struct zram_stats stats;
+#ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
+	/* Protected by init_lock; deliberately outside resettable statistics. */
+	u64 wb_instance;
+	u64 wb_generation;
+#endif
 	/*
 	 * This is the limit on amount of *uncompressed* worth of data
 	 * we can store in a disk.

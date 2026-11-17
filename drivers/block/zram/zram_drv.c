@@ -37,6 +37,12 @@
 #include <linux/cpuhotplug.h>
 #include <linux/swap.h>
 #include <linux/sched.h>
+#include <linux/capability.h>
+#include <linux/compat.h>
+#include <linux/random.h>
+#include <linux/timekeeping.h>
+#include <linux/uaccess.h>
+#include <uapi/linux/zram.h>
 
 #include "zram_drv.h"
 
@@ -90,6 +96,27 @@ static inline struct zram *dev_to_zram(struct device *dev)
 {
 	return (struct zram *)dev_to_disk(dev)->private_data;
 }
+
+#ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
+static void zram_wb_new_instance(struct zram *zram)
+{
+	u64 old = zram->wb_instance;
+
+	do {
+		zram->wb_instance = get_random_u64();
+	} while (!zram->wb_instance || zram->wb_instance == old);
+	zram->wb_generation = 1;
+}
+
+/* Caller holds init_lock exclusively, or the device is not yet published. */
+static void zram_wb_generation_advance(struct zram *zram)
+{
+	if (!zram->wb_instance || !++zram->wb_generation)
+		zram_wb_new_instance(zram);
+}
+#else
+static inline void zram_wb_generation_advance(struct zram *zram) { }
+#endif
 
 static unsigned long zram_get_handle(struct zram *zram, u32 index)
 {
@@ -469,6 +496,7 @@ static void reset_bdev(struct zram *zram)
 	zram->disk->fops = &zram_devops;
 	kvfree(zram->bitmap);
 	zram->bitmap = NULL;
+	zram_wb_generation_advance(zram);
 }
 
 static ssize_t backing_dev_show(struct device *dev,
@@ -587,6 +615,7 @@ static ssize_t backing_dev_store(struct device *dev,
 	 * use-after-free when the IO is really done.
 	 */
 	zram->disk->fops = &zram_wb_devops;
+	zram_wb_generation_advance(zram);
 	up_write(&zram->init_lock);
 
 	pr_info("setup backing device %s\n", file_name);
@@ -773,15 +802,28 @@ static void zram_wb_refund(struct zram *zram, unsigned int nr)
 	spin_unlock(&zram->wb_limit_lock);
 }
 
-/* Return installed pages, not submitted pages. Also releases all unused slots. */
+/* Record the first terminal cause; cleanup/caps must not replace an error. */
+static int zram_wb_stop(struct zram_wb_exec *req, u32 reason, int err, u32 stage)
+{
+	if (!req->stop_reason) {
+		req->stop_reason = reason;
+		req->op_errno = err;
+		req->error_stage = stage;
+	}
+	return err;
+}
+
+/* Also releases all unused slots; each selection is finalized exactly once. */
 static unsigned int zram_wb_complete(struct zram *zram,
-		struct zram_wb_batch *batch, unsigned int submitted, int err)
+		struct zram_wb_batch *batch, unsigned int submitted, int err,
+		struct zram_wb_exec *req)
 {
 	unsigned int i, installed = 0;
 
 	for (i = 0; i < batch->nr; i++) {
 		u32 index = batch->entries[i].index;
 		unsigned long blk_idx = batch->entries[i].blk_idx;
+		bool valid;
 
 		zram_slot_lock(zram, index);
 		/*
@@ -791,9 +833,12 @@ static unsigned int zram_wb_complete(struct zram *zram,
 		 * IDLE cannot become true again after any invalidating operation,
 		 * even if the same handle is reused (no handle-based ABA check).
 		 */
-		if (i < submitted && !err && zram_allocated(zram, index) &&
-		    zram_test_flag(zram, index, ZRAM_UNDER_WB) &&
-		    zram_test_flag(zram, index, ZRAM_IDLE)) {
+		valid = zram_allocated(zram, index) &&
+			zram_test_flag(zram, index, ZRAM_UNDER_WB) &&
+			zram_test_flag(zram, index, ZRAM_IDLE);
+		if (!valid)
+			req->invalidated_pages++;
+		if (i < submitted && !err && valid) {
 			zram_free_page(zram, index);
 			zram_set_flag(zram, index, ZRAM_WB);
 			zram_set_element(zram, index, blk_idx);
@@ -801,6 +846,8 @@ static unsigned int zram_wb_complete(struct zram *zram,
 			atomic64_inc(&zram->stats.bd_count);
 			blk_idx = 0;
 			installed++;
+			/* Count at installation, never by subtracting global stats. */
+			req->installed_pages++;
 		}
 		/* Never clear the replacement object's idle count or other flags. */
 		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
@@ -814,7 +861,7 @@ static unsigned int zram_wb_complete(struct zram *zram,
 }
 
 static int zram_wb_flush(struct zram *zram, struct zram_wb_batch *batch,
-		unsigned long *written)
+		struct zram_wb_exec *req)
 {
 	struct bio bio;
 	unsigned int i, nr;
@@ -824,15 +871,18 @@ static int zram_wb_flush(struct zram *zram, struct zram_wb_batch *batch,
 	if (!batch->nr)
 		return 0;
 	if (signal_pending(current)) {
-		zram_wb_complete(zram, batch, 0, -EINTR);
-		return -EINTR;
+		zram_wb_complete(zram, batch, 0, -EINTR, req);
+		return zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+				    ZRAM_WB_STAGE_NONE);
 	}
 
+	/* The engine includes pending snapshots in both per-call limits. */
 	nr = zram_wb_reserve(zram, batch->nr);
 	limited = nr < batch->nr;
 	if (!nr) {
-		zram_wb_complete(zram, batch, 0, -EIO);
-		return -EIO;
+		zram_wb_complete(zram, batch, 0, -EIO, req);
+		return zram_wb_stop(req, ZRAM_WB_STOP_GLOBAL_LIMIT, -EIO,
+				    ZRAM_WB_STAGE_NONE);
 	}
 
 	/* Linux 4.9 stack BIO: reset associations, never bio_put() the stack. */
@@ -840,98 +890,79 @@ static int zram_wb_flush(struct zram *zram, struct zram_wb_batch *batch,
 	bio.bi_io_vec = batch->vecs;
 	bio.bi_max_vecs = ZRAM_WB_BATCH_SIZE;
 	bio.bi_bdev = zram->bdev;
-	bio.bi_iter.bi_sector = batch->entries[0].blk_idx * SECTORS_PER_PAGE;
+	bio.bi_iter.bi_sector = (sector_t)batch->entries[0].blk_idx * SECTORS_PER_PAGE;
 	bio_set_op_attrs(&bio, REQ_OP_WRITE, REQ_SYNC);
 	for (i = 0; i < nr; i++) {
-		if (bio_add_page(&bio, batch->pages[i], PAGE_SIZE, 0) != PAGE_SIZE)
+		if (bio_add_page(&bio, batch->pages[i], PAGE_SIZE, 0) != PAGE_SIZE) {
+			zram_wb_stop(req, ZRAM_WB_STOP_ERROR, err, ZRAM_WB_STAGE_BIO_BUILD);
 			goto refund;
+		}
 	}
 	if (signal_pending(current)) {
-		err = -EINTR;
+		err = zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+				   ZRAM_WB_STAGE_NONE);
 		goto refund;
 	}
 	/* Attempted physical pages, including failed/partially completed BIOs. */
 	atomic64_add(nr, &zram->stats.bd_writes);
+	req->submitted_pages += nr;
 	err = submit_bio_wait(&bio);
 	bio_reset(&bio);
-	if (!err && signal_pending(current))
-		err = -EINTR;
-	*written += zram_wb_complete(zram, batch, nr, err);
-	return err ? err : (limited ? -EIO : 0);
+	if (err)
+		zram_wb_stop(req, ZRAM_WB_STOP_ERROR, err, ZRAM_WB_STAGE_IO);
+	else if (signal_pending(current))
+		err = zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+				   ZRAM_WB_STAGE_NONE);
+	zram_wb_complete(zram, batch, nr, err, req);
+	if (!err && limited)
+		err = zram_wb_stop(req, ZRAM_WB_STOP_GLOBAL_LIMIT, -EIO,
+				   ZRAM_WB_STAGE_NONE);
+	return err;
 
 refund:
 	bio_reset(&bio);
 	zram_wb_refund(zram, nr);
-	zram_wb_complete(zram, batch, 0, err);
+	zram_wb_complete(zram, batch, 0, err, req);
 	return err;
 }
 
-static ssize_t writeback_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
+/* init_lock is held for the whole call, including identity validation by EXEC. */
+static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 {
-	struct zram *zram = dev_to_zram(dev);
-	unsigned long nr_pages;
-	unsigned long index = 0, max_pages = ULONG_MAX, written = 0;
-	unsigned int idle_count = 1, allocated = 0, capacity;
+	u64 nr_pages = zram->disksize >> PAGE_SHIFT;
+	u64 index = req->page_index;
+	unsigned int allocated = 0, capacity;
 	struct zram_wb_batch *batch;
-	ssize_t ret = len;
-	int mode, err;
 	unsigned long blk_idx = 0;
+	int err = 0;
 
-	if (sysfs_streq(buf, "idle"))
-		mode = IDLE_WRITEBACK;
-	else if (sysfs_streq(buf, "huge"))
-		mode = HUGE_WRITEBACK;
-	else if (!strncmp(buf, "idle ", 5)) {
-		err = writeback_parse_filter(buf, len, &max_pages, &idle_count);
-		if (err)
-			return err;
-		mode = FILTERED_IDLE_WRITEBACK;
-	} else {
-		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
-			return -EINVAL;
-
-		if (kstrtoul(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index))
-			return -EINVAL;
-
-		mode = PAGE_WRITEBACK;
-	}
-
-	down_read(&zram->init_lock);
-	if (!init_done(zram)) {
-		ret = -EINVAL;
-		goto release_init_lock;
-	}
-
-	if (!zram->backing_dev) {
-		ret = -ENODEV;
-		goto release_init_lock;
-	}
-
-	nr_pages = zram->disksize >> PAGE_SHIFT;
-	if (mode == PAGE_WRITEBACK) {
-		if (index >= nr_pages) {
-			ret = -EINVAL;
-			goto release_init_lock;
-		}
+	/* All slot helpers take u32 indices; reject rather than silently truncate. */
+	if (nr_pages > (1ULL << 32))
+		return zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -EOVERFLOW,
+				    ZRAM_WB_STAGE_NONE);
+	if (req->mode == PAGE_WRITEBACK) {
+		if (index >= nr_pages)
+			return zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -EINVAL,
+					    ZRAM_WB_STAGE_NONE);
 		nr_pages = 1;
 	}
-	if (!max_pages)
-		goto release_init_lock;
+	if (!req->max_attempt_pages || !req->max_installed_pages)
+		return zram_wb_stop(req, ZRAM_WB_STOP_NO_WORK, 0, ZRAM_WB_STAGE_NONE);
 
-	if (mutex_lock_interruptible(&zram->wb_mutex)) {
-		ret = -EINTR;
-		goto release_init_lock;
-	}
+	if (mutex_lock_interruptible(&zram->wb_mutex))
+		return zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+				    ZRAM_WB_STAGE_NONE);
 	batch = kzalloc(sizeof(*batch), GFP_NOIO);
 	if (!batch) {
-		ret = -ENOMEM;
+		err = zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -ENOMEM, ZRAM_WB_STAGE_ALLOC);
 		goto release_wb_mutex;
 	}
-	capacity = min_t(unsigned long, ZRAM_WB_BATCH_SIZE, max_pages);
+	capacity = min_t(u64, ZRAM_WB_BATCH_SIZE, req->max_installed_pages);
+	capacity = min_t(u64, capacity, req->max_attempt_pages);
 	for (; allocated < capacity; allocated++) {
 		if (signal_pending(current)) {
-			ret = -EINTR;
+			err = zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+					   ZRAM_WB_STAGE_NONE);
 			goto release_batch;
 		}
 		batch->pages[allocated] = alloc_page(GFP_NOIO);
@@ -940,43 +971,48 @@ static ssize_t writeback_store(struct device *dev,
 	}
 	/* A partial preallocation is usable; zero pages cannot make progress. */
 	if (!allocated) {
-		ret = -ENOMEM;
+		err = zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -ENOMEM, ZRAM_WB_STAGE_ALLOC);
 		goto release_batch;
 	}
 
-	for (; nr_pages && written < max_pages; index++, nr_pages--) {
+	for (; nr_pages && req->installed_pages < req->max_installed_pages &&
+	       req->submitted_pages < req->max_attempt_pages; index++, nr_pages--) {
 		unsigned int n;
 
 		if (signal_pending(current)) {
-			ret = -EINTR;
+			err = zram_wb_stop(req, ZRAM_WB_STOP_INTERRUPTED, -EINTR,
+					   ZRAM_WB_STAGE_NONE);
 			break;
 		}
+		req->scanned_pages++;
 		/* Do not claim a backing slot for a non-candidate. */
 		zram_slot_lock(zram, index);
-		err = zram_writeback_match(zram, index, mode, idle_count);
+		err = zram_writeback_match(zram, index, req->mode, req->idle_count);
 		zram_slot_unlock(zram, index);
 		if (!err)
 			goto next;
+		err = 0;
 
 		blk_idx = alloc_block_bdev(zram);
 		if (!blk_idx) {
 			/* Complete useful work already gathered before reporting full. */
-			err = zram_wb_flush(zram, batch, &written);
-			ret = err ? err : (written == max_pages ? len : -ENOSPC);
+			err = zram_wb_flush(zram, batch, req);
+			if (!err && req->installed_pages < req->max_installed_pages &&
+			    req->submitted_pages < req->max_attempt_pages)
+				err = zram_wb_stop(req, ZRAM_WB_STOP_BACKING_FULL, -ENOSPC,
+						   ZRAM_WB_STAGE_NONE);
 			break;
 		}
 		/* Logical zram adjacency is irrelevant; backing sectors must adjoin. */
 		if (batch->nr && blk_idx !=
 		    batch->entries[batch->nr - 1].blk_idx + 1) {
-			err = zram_wb_flush(zram, batch, &written);
-			if (err) {
-				ret = err;
+			err = zram_wb_flush(zram, batch, req);
+			if (err)
 				break;
-			}
 		}
 
 		zram_slot_lock(zram, index);
-		if (!zram_writeback_match(zram, index, mode, idle_count)) {
+		if (!zram_writeback_match(zram, index, req->mode, req->idle_count)) {
 			zram_slot_unlock(zram, index);
 			free_block_bdev(zram, blk_idx);
 			blk_idx = 0;
@@ -985,13 +1021,14 @@ static ssize_t writeback_store(struct device *dev,
 		n = batch->nr;
 		zram_set_flag(zram, index, ZRAM_UNDER_WB);
 		zram_set_flag(zram, index, ZRAM_IDLE);
+		req->selected_pages++;
 		/* Snapshot and ownership are established under the same slot lock. */
 		err = zram_read_from_zspool(zram, batch->pages[n], index);
 		if (err) {
 			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
 			zram_clear_flag(zram, index, ZRAM_IDLE);
 			zram_slot_unlock(zram, index);
-			ret = err;
+			zram_wb_stop(req, ZRAM_WB_STOP_ERROR, err, ZRAM_WB_STAGE_SNAPSHOT_READ);
 			break;
 		}
 		batch->entries[n].index = index;
@@ -1000,24 +1037,21 @@ static ssize_t writeback_store(struct device *dev,
 		blk_idx = 0;
 		zram_slot_unlock(zram, index);
 
-		/* Pending successes cannot take this request past max_pages. */
-		if (batch->nr == allocated || batch->nr == max_pages - written) {
-			err = zram_wb_flush(zram, batch, &written);
-			if (err) {
-				ret = err;
+		/* Include pending snapshots in both independent per-call bounds. */
+		if (batch->nr == allocated ||
+		    batch->nr == req->max_installed_pages - req->installed_pages ||
+		    batch->nr == req->max_attempt_pages - req->submitted_pages) {
+			err = zram_wb_flush(zram, batch, req);
+			if (err)
 				break;
-			}
 		}
 next:
 		cond_resched();
 	}
-	if (ret == len) {
-		err = zram_wb_flush(zram, batch, &written);
-		if (err)
-			ret = err;
-	}
+	if (!err)
+		err = zram_wb_flush(zram, batch, req);
 	/* Errors/signals discard only this request's unsubmitted snapshots. */
-	zram_wb_complete(zram, batch, 0, -ECANCELED);
+	zram_wb_complete(zram, batch, 0, -ECANCELED, req);
 	if (blk_idx)
 		free_block_bdev(zram, blk_idx);
 release_batch:
@@ -1026,10 +1060,57 @@ release_batch:
 	kfree(batch);
 release_wb_mutex:
 	mutex_unlock(&zram->wb_mutex);
-release_init_lock:
-	up_read(&zram->init_lock);
+	if (!err) {
+		u32 reason = ZRAM_WB_STOP_COMPLETE;
 
-	return ret;
+		/* Ties prefer the installation goal; errors always have precedence. */
+		if (req->installed_pages == req->max_installed_pages)
+			reason = ZRAM_WB_STOP_INSTALLED_LIMIT;
+		else if (req->submitted_pages == req->max_attempt_pages)
+			reason = ZRAM_WB_STOP_ATTEMPT_LIMIT;
+		zram_wb_stop(req, reason, 0, ZRAM_WB_STAGE_NONE);
+	}
+	return err;
+}
+
+static ssize_t writeback_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	struct zram_wb_exec req = { .max_attempt_pages = U64_MAX };
+	unsigned long index = 0, max_pages = ULONG_MAX;
+	unsigned int idle_count = 1;
+	int err;
+
+	if (sysfs_streq(buf, "idle"))
+		req.mode = IDLE_WRITEBACK;
+	else if (sysfs_streq(buf, "huge"))
+		req.mode = HUGE_WRITEBACK;
+	else if (!strncmp(buf, "idle ", 5)) {
+		err = writeback_parse_filter(buf, len, &max_pages, &idle_count);
+		if (err)
+			return err;
+		req.mode = FILTERED_IDLE_WRITEBACK;
+	} else {
+		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
+			return -EINVAL;
+		if (kstrtoul(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index))
+			return -EINVAL;
+		req.mode = PAGE_WRITEBACK;
+	}
+	req.page_index = index;
+	req.max_installed_pages = max_pages;
+	req.idle_count = idle_count;
+
+	down_read(&zram->init_lock);
+	if (!init_done(zram))
+		err = -EINVAL;
+	else if (!zram->backing_dev)
+		err = -ENODEV;
+	else
+		err = zram_writeback_engine(zram, &req);
+	up_read(&zram->init_lock);
+	return err ? err : len;
 }
 
 struct zram_work {
@@ -1100,6 +1181,144 @@ static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
 }
 
 static void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
+#endif
+
+#ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
+static int zram_wb_exec_validate(const struct zram_wb_exec *req)
+{
+	if (req->size != sizeof(*req))
+		return -EINVAL;
+	if (req->version != ZRAM_WB_ABI_VERSION)
+		return -EPROTONOSUPPORT;
+	if (req->flags || !req->request_id || req->reserved0 ||
+	    memchr_inv(req->reserved, 0, sizeof(req->reserved)) ||
+	    memchr_inv(&req->scanned_pages, 0,
+		       sizeof(*req) - offsetof(struct zram_wb_exec, scanned_pages)))
+		return -EINVAL;
+	if (req->mode > ZRAM_WB_MODE_FILTERED_IDLE ||
+	    req->max_installed_pages > req->max_attempt_pages)
+		return -EINVAL;
+	if (req->mode == ZRAM_WB_MODE_FILTERED_IDLE) {
+		if (req->idle_count > ZRAM_IDLE_COUNT_MAX)
+			return -EINVAL;
+	} else if (req->idle_count) {
+		return -EINVAL;
+	}
+	if ((req->mode != ZRAM_WB_MODE_PAGE && req->page_index) ||
+	    req->page_index > U32_MAX)
+		return -EINVAL;
+	return 0;
+}
+
+static int zram_wb_exec_ioctl(struct zram *zram, void __user *argp)
+{
+	struct zram_wb_exec req;
+	u64 start;
+	int err;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	err = zram_wb_exec_validate(&req);
+	if (err)
+		return err;
+
+	start = ktime_get_ns();
+	down_read(&zram->init_lock);
+	if (req.expected_instance != zram->wb_instance ||
+	    req.expected_generation != zram->wb_generation)
+		zram_wb_stop(&req, ZRAM_WB_STOP_STALE, -ESTALE, ZRAM_WB_STAGE_NONE);
+	else if (!init_done(zram) || !zram->backing_dev)
+		zram_wb_stop(&req, ZRAM_WB_STOP_NOT_READY, -ENODEV, ZRAM_WB_STAGE_NONE);
+	else
+		zram_writeback_engine(zram, &req);
+	up_read(&zram->init_lock);
+	req.duration_ns = ktime_get_ns() - start;
+
+	/* Effects and physical-write charges survive copyout failure. No restart. */
+	return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
+}
+
+static int zram_wb_status_ioctl(struct zram *zram, void __user *argp)
+{
+	struct zram_wb_status status;
+
+	if (copy_from_user(&status, argp, sizeof(status)))
+		return -EFAULT;
+	if (status.size != sizeof(status))
+		return -EINVAL;
+	if (status.version != ZRAM_WB_ABI_VERSION)
+		return -EPROTONOSUPPORT;
+	if (memchr_inv(&status.flags, 0,
+		       sizeof(status) - offsetof(struct zram_wb_status, flags)))
+		return -EINVAL;
+
+	status.capabilities = ZRAM_WB_CAP_EXEC | ZRAM_WB_CAP_STATUS |
+		ZRAM_WB_CAP_FILTERED_IDLE | ZRAM_WB_CAP_DUAL_LIMIT;
+	status.page_size = PAGE_SIZE;
+	down_read(&zram->init_lock);
+	status.instance = zram->wb_instance;
+	status.generation = zram->wb_generation;
+	status.disksize_bytes = zram->disksize;
+	if (init_done(zram)) {
+		status.state_flags |= ZRAM_WB_STATE_INITIALIZED;
+		status.mem_used_bytes = (u64)zs_get_total_pages(zram->mem_pool) << PAGE_SHIFT;
+	}
+	if (zram->backing_dev)
+		status.state_flags |= ZRAM_WB_STATE_BACKING;
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable)
+		status.state_flags |= ZRAM_WB_STATE_GLOBAL_LIMIT;
+	status.wb_limit_remaining_4k = zram->bd_wb_limit;
+	spin_unlock(&zram->wb_limit_lock);
+	/* Individually sampled: no all-fields-coherent statistics guarantee. */
+	status.pages_stored = atomic64_read(&zram->stats.pages_stored);
+	status.same_pages = atomic64_read(&zram->stats.same_pages);
+	status.huge_pages = atomic64_read(&zram->stats.huge_pages);
+	status.lowratio_pages = atomic64_read(&zram->stats.lowratio_pages);
+	status.bd_count_pages = atomic64_read(&zram->stats.bd_count);
+	status.bd_reads_pages = atomic64_read(&zram->stats.bd_reads);
+	status.bd_writes_pages = atomic64_read(&zram->stats.bd_writes);
+	status.compr_data_bytes = atomic64_read(&zram->stats.compr_data_size);
+	up_read(&zram->init_lock);
+	return copy_to_user(argp, &status, sizeof(status)) ? -EFAULT : 0;
+}
+#endif
+
+static int zram_ioctl(struct block_device *bdev, fmode_t mode,
+		unsigned int cmd, unsigned long arg)
+{
+#ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
+	struct zram *zram = bdev->bd_disk->private_data;
+	void __user *argp = (void __user *)arg;
+
+	switch (cmd) {
+	case ZRAM_IOC_WB_EXEC:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (!(mode & FMODE_WRITE))
+			return -EBADF;
+		return zram_wb_exec_ioctl(zram, argp);
+	case ZRAM_IOC_WB_STATUS:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return zram_wb_status_ioctl(zram, argp);
+	default:
+		/* Known command number with a malformed size/direction is not legacy. */
+		if (_IOC_TYPE(cmd) == 'Z' &&
+		    (_IOC_NR(cmd) == 0x20 || _IOC_NR(cmd) == 0x21))
+			return -EINVAL;
+	}
+#endif
+	/* Block-layer native/compat fallbacks turn this into user-visible ENOTTY. */
+	return -ENOIOCTLCMD;
+}
+
+#ifdef CONFIG_COMPAT
+static int zram_compat_ioctl(struct block_device *bdev, fmode_t mode,
+		unsigned int cmd, unsigned long arg)
+{
+	return zram_ioctl(bdev, mode, cmd, (unsigned long)compat_ptr(arg));
+}
 #endif
 
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
@@ -2545,6 +2764,8 @@ static void zram_reset_device(struct zram *zram)
 			       10, 0, zram->disksize, 0);
 
 	zram->limit_pages = 0;
+	/* Accepted reset/removal invalidates tokens, including the early return. */
+	zram_wb_generation_advance(zram);
 
 	if (!init_done(zram)) {
 		if (swap_owner_diag)
@@ -2668,6 +2889,7 @@ static ssize_t disksize_store(struct device *dev,
 	}
 
 	zram->disksize = disksize;
+	zram_wb_generation_advance(zram);
 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
 	revalidate_disk(zram->disk);
 	zram_owner_log(zram, "disksize", "exit", buf, len,
@@ -2766,6 +2988,10 @@ static int zram_open(struct block_device *bdev, fmode_t mode)
 
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
+	.ioctl = zram_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = zram_compat_ioctl,
+#endif
 	.swap_slot_free_notify = zram_slot_free_notify,
 	.rw_page = zram_rw_page,
 	.owner = THIS_MODULE
@@ -2773,6 +2999,10 @@ static const struct block_device_operations zram_devops = {
 
 static const struct block_device_operations zram_wb_devops = {
 	.open = zram_open,
+	.ioctl = zram_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = zram_compat_ioctl,
+#endif
 	.swap_slot_free_notify = zram_slot_free_notify,
 	.owner = THIS_MODULE
 };
@@ -2853,6 +3083,12 @@ static int zram_add(void)
 	struct request_queue *queue;
 	int ret, device_id;
 
+	BUILD_BUG_ON(sizeof(struct zram_wb_exec) != 160);
+	BUILD_BUG_ON(sizeof(struct zram_wb_status) != 192);
+	BUILD_BUG_ON(offsetof(struct zram_wb_exec, scanned_pages) != 96);
+	BUILD_BUG_ON(offsetof(struct zram_wb_exec, error_stage) != 152);
+	BUILD_BUG_ON(offsetof(struct zram_wb_status, capabilities) != 32);
+
 	zram = kzalloc(sizeof(struct zram), GFP_KERNEL);
 	if (!zram)
 		return -ENOMEM;
@@ -2863,6 +3099,7 @@ static int zram_add(void)
 	device_id = ret;
 
 	init_rwsem(&zram->init_lock);
+	zram_wb_generation_advance(zram);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	mutex_init(&zram->wb_mutex);
 	spin_lock_init(&zram->wb_limit_lock);
