@@ -98,6 +98,24 @@ config ZRAM_WRITEBACK_IOCTL
 	  respects the existing device writeback quota. Requires CAP_SYS_ADMIN.
 	  The existing sysfs interface is unchanged. If unsure, say N.
 
+config ZRAM_ACCESS_TRACKING
+	bool "Track zram access age independently of debugfs"
+	depends on ZRAM
+	default n
+	help
+	  Maintain per-slot boottime access timestamps for bounded cold selection.
+	  Adds one timestamp per slot. No debugfs dependency.
+
+config ZRAM_POOL_POLICY
+	bool "Userspace-driven physical pool demand and cold writeback policy"
+	depends on ZRAM_WRITEBACK_IOCTL
+	select ZRAM_ACCESS_TRACKING
+	default n
+	help
+	  Export configurable physical zsmalloc pool demand through pollable sysfs
+	  and a separate bounded cold-age EXEC ioctl. Runtime default is disabled.
+	  The coalesced sampling worker never submits writeback or BIOs.
+
 config ZRAM_MEMORY_TRACKING
 	bool "Track zRam block status"
 	depends on ZRAM && DEBUG_FS
@@ -107,6 +125,16 @@ config ZRAM_MEMORY_TRACKING
 	  /sys/kernel/debug/zram/zramX/block_state.
 
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
+
+config ZRAM_POOL_OBSERVER
+	bool "Observe zram physical pool pressure in debugfs"
+	depends on ZRAM && DEBUG_FS
+	default n
+	help
+	  Provide a read-only, on-demand snapshot of zram's zsmalloc pool
+	  with high/low watermarks and a bounded eligibility scan when
+	  writeback is compiled in. Access age requires memory tracking.
+	  This does not schedule work or perform writeback. If unsure, say N.
 
 config ZRAM_HARDCODE_DISKSIZE
 	bool "Force zram disksize to physical RAM size (ZRAM 1:1)"

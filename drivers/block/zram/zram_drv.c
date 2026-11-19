@@ -45,6 +45,13 @@
 #include <uapi/linux/zram.h>
 
 #include "zram_drv.h"
+#include <uapi/linux/zram_policy.h>
+
+#ifdef CONFIG_ZRAM_POOL_POLICY
+static void zram_policy_event(struct zram *zram);
+#else
+static inline void zram_policy_event(struct zram *zram) { }
+#endif
 
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
@@ -113,6 +120,11 @@ static void zram_wb_generation_advance(struct zram *zram)
 {
 	if (!zram->wb_instance || !++zram->wb_generation)
 		zram_wb_new_instance(zram);
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	/* Lifecycle invalidation is required even with runtime policy disabled. */
+	if (zram->disk && !READ_ONCE(zram->policy_removing))
+		schedule_work(&zram->policy_work);
+#endif
 }
 #else
 static inline void zram_wb_generation_advance(struct zram *zram) { }
@@ -767,6 +779,26 @@ static bool zram_writeback_match(struct zram *zram, u32 index, int mode,
 	}
 }
 
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+int zram_pool_observer_slot(struct zram *zram, u32 index, s64 *access_ns)
+{
+	bool eligible;
+
+	if (!zram_slot_trylock(zram, index))
+		return -EBUSY;
+
+	eligible = zram_writeback_match(zram, index,
+					FILTERED_IDLE_WRITEBACK, 1);
+	*access_ns = 0;
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_ACCESS_TRACKING)
+	if (eligible)
+		*access_ns = ktime_to_ns(zram->table[index].ac_time);
+#endif
+	zram_slot_unlock(zram, index);
+	return eligible;
+}
+#endif
+
 #define ZRAM_WB_BATCH_SIZE 32
 
 /* Request-private storage; never allocate pages under a slot bit_spinlock. */
@@ -926,11 +958,32 @@ refund:
 	return err;
 }
 
+/* With a policy, age replaces v1 mode/idle-mark selection, not B accounting. */
+static bool zram_wb_policy_match(struct zram *zram, u32 index,
+		struct zram_wb_exec *req, struct zram_wb_policy_exec *policy,
+		u64 sample_ns)
+{
+	if (!policy)
+		return zram_writeback_match(zram, index, req->mode, req->idle_count);
+#ifdef CONFIG_ZRAM_ACCESS_TRACKING
+	if (zram_writeback_match(zram, index, PAGE_WRITEBACK, 0)) {
+		s64 access_ns = ktime_to_ns(zram->table[index].ac_time);
+
+		return access_ns > 0 && access_ns <= sample_ns &&
+			sample_ns - access_ns >= policy->min_age_ns;
+	}
+#endif
+	return false;
+}
+
 /* init_lock is held for the whole call, including identity validation by EXEC. */
-static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
+static int zram_writeback_engine_policy(struct zram *zram, struct zram_wb_exec *req,
+		struct zram_wb_policy_exec *policy)
 {
 	u64 nr_pages = zram->disksize >> PAGE_SHIFT;
-	u64 index = req->page_index;
+	u64 index = policy ? policy->start_index : req->page_index;
+	u64 device_pages = nr_pages;
+	u64 sample_ns = ktime_to_ns(ktime_get_boottime());
 	unsigned int allocated = 0, capacity;
 	struct zram_wb_batch *batch;
 	unsigned long blk_idx = 0;
@@ -940,7 +993,9 @@ static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 	if (nr_pages > (1ULL << 32))
 		return zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -EOVERFLOW,
 				    ZRAM_WB_STAGE_NONE);
-	if (req->mode == PAGE_WRITEBACK) {
+	if (policy) {
+		nr_pages = min_t(u64, nr_pages, policy->max_scanned_pages);
+	} else if (req->mode == PAGE_WRITEBACK) {
 		if (index >= nr_pages)
 			return zram_wb_stop(req, ZRAM_WB_STOP_ERROR, -EINVAL,
 					    ZRAM_WB_STAGE_NONE);
@@ -976,7 +1031,7 @@ static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 	}
 
 	for (; nr_pages && req->installed_pages < req->max_installed_pages &&
-	       req->submitted_pages < req->max_attempt_pages; index++, nr_pages--) {
+	       req->submitted_pages < req->max_attempt_pages; nr_pages--) {
 		unsigned int n;
 
 		if (signal_pending(current)) {
@@ -985,9 +1040,11 @@ static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 			break;
 		}
 		req->scanned_pages++;
+		if (policy)
+			policy->next_index = index + 1 == device_pages ? 0 : index + 1;
 		/* Do not claim a backing slot for a non-candidate. */
 		zram_slot_lock(zram, index);
-		err = zram_writeback_match(zram, index, req->mode, req->idle_count);
+		err = zram_wb_policy_match(zram, index, req, policy, sample_ns);
 		zram_slot_unlock(zram, index);
 		if (!err)
 			goto next;
@@ -1012,7 +1069,7 @@ static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 		}
 
 		zram_slot_lock(zram, index);
-		if (!zram_writeback_match(zram, index, req->mode, req->idle_count)) {
+		if (!zram_wb_policy_match(zram, index, req, policy, sample_ns)) {
 			zram_slot_unlock(zram, index);
 			free_block_bdev(zram, blk_idx);
 			blk_idx = 0;
@@ -1046,6 +1103,10 @@ static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
 				break;
 		}
 next:
+		if (++index == device_pages)
+			index = 0;
+		if (policy)
+			policy->next_index = index;
 		cond_resched();
 	}
 	if (!err)
@@ -1068,10 +1129,21 @@ release_wb_mutex:
 			reason = ZRAM_WB_STOP_INSTALLED_LIMIT;
 		else if (req->submitted_pages == req->max_attempt_pages)
 			reason = ZRAM_WB_STOP_ATTEMPT_LIMIT;
+		else if (policy && req->scanned_pages == policy->max_scanned_pages)
+			reason = ZRAM_WB_STOP_SCANNED_LIMIT;
 		zram_wb_stop(req, reason, 0, ZRAM_WB_STAGE_NONE);
 	}
 	return err;
 }
+
+static int zram_writeback_engine(struct zram *zram, struct zram_wb_exec *req)
+{
+	return zram_writeback_engine_policy(zram, req, NULL);
+}
+
+#ifdef CONFIG_ZRAM_POOL_POLICY
+#include "zram_pool_policy.c"
+#endif
 
 static ssize_t writeback_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
@@ -1292,6 +1364,14 @@ static int zram_ioctl(struct block_device *bdev, fmode_t mode,
 	void __user *argp = (void __user *)arg;
 
 	switch (cmd) {
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	case ZRAM_IOC_WB_POLICY_EXEC:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (!(mode & FMODE_WRITE))
+			return -EBADF;
+		return zram_wb_policy_ioctl(zram, argp);
+#endif
 	case ZRAM_IOC_WB_EXEC:
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
@@ -1305,7 +1385,8 @@ static int zram_ioctl(struct block_device *bdev, fmode_t mode,
 	default:
 		/* Known command number with a malformed size/direction is not legacy. */
 		if (_IOC_TYPE(cmd) == 'Z' &&
-		    (_IOC_NR(cmd) == 0x20 || _IOC_NR(cmd) == 0x21))
+		    (_IOC_NR(cmd) == 0x20 || _IOC_NR(cmd) == 0x21 ||
+		     _IOC_NR(cmd) == 0x22))
 			return -EINVAL;
 	}
 #endif
@@ -1321,8 +1402,7 @@ static int zram_compat_ioctl(struct block_device *bdev, fmode_t mode,
 }
 #endif
 
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
-
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_POOL_OBSERVER)
 static struct dentry *zram_debugfs_root;
 
 static void zram_debugfs_create(void)
@@ -1335,12 +1415,20 @@ static void zram_debugfs_destroy(void)
 	debugfs_remove_recursive(zram_debugfs_root);
 }
 
+#else
+static void zram_debugfs_create(void) { }
+static void zram_debugfs_destroy(void) { }
+#endif
+
 static void zram_accessed(struct zram *zram, u32 index)
 {
 	zram_clear_flag(zram, index, ZRAM_IDLE);
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_ACCESS_TRACKING)
 	zram->table[index].ac_time = ktime_get_boottime();
+#endif
 }
 
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
 static ssize_t read_block_state(struct file *file, char __user *buf,
 				size_t count, loff_t *ppos)
 {
@@ -1403,15 +1491,25 @@ static const struct file_operations proc_zram_block_state_op = {
 	.llseek = default_llseek,
 };
 
+#endif
+
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_POOL_OBSERVER)
 static void zram_debugfs_register(struct zram *zram)
 {
-	if (!zram_debugfs_root)
+	if (IS_ERR_OR_NULL(zram_debugfs_root))
 		return;
 
 	zram->debugfs_dir = debugfs_create_dir(zram->disk->disk_name,
 						zram_debugfs_root);
+	if (IS_ERR_OR_NULL(zram->debugfs_dir))
+		return;
+#ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	debugfs_create_file("block_state", 0400, zram->debugfs_dir,
 				zram, &proc_zram_block_state_op);
+#endif
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+	zram_pool_observer_register(zram);
+#endif
 }
 
 static void zram_debugfs_unregister(struct zram *zram)
@@ -1419,14 +1517,8 @@ static void zram_debugfs_unregister(struct zram *zram)
 	debugfs_remove_recursive(zram->debugfs_dir);
 }
 #else
-static void zram_debugfs_create(void) {};
-static void zram_debugfs_destroy(void) {};
-static void zram_accessed(struct zram *zram, u32 index)
-{
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-};
-static void zram_debugfs_register(struct zram *zram) {};
-static void zram_debugfs_unregister(struct zram *zram) {};
+static void zram_debugfs_register(struct zram *zram) { }
+static void zram_debugfs_unregister(struct zram *zram) { }
 #endif
 
 /*
@@ -1656,6 +1748,7 @@ static ssize_t compact_store(struct device *dev,
 	}
 
 	zs_compact(zram->mem_pool);
+	zram_policy_event(zram);
 	up_read(&zram->init_lock);
 
 	return len;
@@ -1900,7 +1993,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
 
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_ACCESS_TRACKING)
 	zram->table[index].ac_time = ktime_set(0, 0);
 #endif
 	if (zram_test_flag(zram, index, ZRAM_IDLE))
@@ -1954,6 +2047,7 @@ out:
 	zram_set_obj_size(zram, index, 0);
 	WARN_ON_ONCE(zram->table[index].flags &
 		~(1UL << ZRAM_LOCK | 1UL << ZRAM_UNDER_WB));
+	zram_policy_event(zram);
 }
 
 static int zram_read_from_zspool(struct zram *zram, struct page *page,
@@ -2012,8 +2106,8 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
 	int ret;
 
 	zram_slot_lock(zram, index);
-	/* Invalidate a pending writeback before the read, not after I/O returns. */
-	zram_clear_flag(zram, index, ZRAM_IDLE);
+	/* Publish access and invalidate writeback BEFORE reading under slot lock. */
+	zram_accessed(zram, index);
 	if (zram_test_flag(zram, index, ZRAM_WB)) {
 		struct bio_vec bvec;
 
@@ -2173,6 +2267,7 @@ compress_again:
 
 	alloced_pages = zs_get_total_pages(zram->mem_pool);
 	update_used_max(zram, alloced_pages);
+	zram_policy_event(zram);
 
 	if (zram->limit_pages && alloced_pages > zram->limit_pages) {
 		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
@@ -2764,6 +2859,15 @@ static void zram_reset_device(struct zram *zram)
 			       10, 0, zram->disksize, 0);
 
 	zram->limit_pages = 0;
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	mutex_lock(&zram->policy_lock);
+	zram->policy_enabled = false;
+	mutex_unlock(&zram->policy_lock);
+#endif
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+	zram->observer_cursor = 0;
+	zram->observer_high = false;
+#endif
 	/* Accepted reset/removal invalidates tokens, including the early return. */
 	zram_wb_generation_advance(zram);
 
@@ -2826,7 +2930,7 @@ static void zram_owner_log(struct zram *zram, const char *op,
 	pr_info("ZRAM_OWNER_DIAG op=%s phase=%s dev=%s pid=%d tgid=%d comm=%s ppid=%d pcomm=%s actual=%llu old=%llu new=%llu totalram=%llu rc=%zd request=%.*s\n",
 		op, phase, zram->disk->disk_name, task_pid_nr(current),
 		task_tgid_nr(current), comm, ppid, pcomm, actual, old_size,
-		READ_ONCE(zram->disksize), (u64)totalram_pages() << PAGE_SHIFT, rc,
+		READ_ONCE(zram->disksize), (u64)totalram_pages << PAGE_SHIFT, rc,
 		(int)min_t(size_t, len, 64), buf);
 }
 
@@ -2847,7 +2951,7 @@ static ssize_t disksize_store(struct device *dev,
 	}
 #ifdef CONFIG_ZRAM_HARDCODE_DISKSIZE
 	/* 内核级 ZRAM 1:1：容量取物理内存大小，写 sysfs 的值仍被忽略 */
-	disksize = (u64)totalram_pages() << PAGE_SHIFT;
+	disksize = (u64)totalram_pages << PAGE_SHIFT;
 #else
 	disksize = memparse(buf, NULL);
 #endif
@@ -3032,6 +3136,10 @@ static DEVICE_ATTR_RW(writeback_limit_enable);
 #endif
 
 static struct attribute *zram_disk_attrs[] = {
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	&dev_attr_pool_policy.attr,
+	&dev_attr_pool_demand.attr,
+#endif
 	&dev_attr_disksize.attr,
 	&dev_attr_initstate.attr,
 	&dev_attr_reset.attr,
@@ -3099,6 +3207,12 @@ static int zram_add(void)
 	device_id = ret;
 
 	init_rwsem(&zram->init_lock);
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	zram_policy_init(zram);
+#endif
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+	mutex_init(&zram->observer_lock);
+#endif
 	zram_wb_generation_advance(zram);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	mutex_init(&zram->wb_mutex);
@@ -3208,6 +3322,13 @@ static int zram_remove(struct zram *zram)
 
 	pr_info("Removed device: %s\n", zram->disk->disk_name);
 
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	mutex_lock(&zram->policy_lock);
+	zram->policy_removing = true;
+	mutex_unlock(&zram->policy_lock);
+	cancel_work_sync(&zram->policy_work);
+	cancel_delayed_work_sync(&zram->policy_age_work);
+#endif
 	del_gendisk(zram->disk);
 	blk_cleanup_queue(zram->disk->queue);
 	put_disk(zram->disk);

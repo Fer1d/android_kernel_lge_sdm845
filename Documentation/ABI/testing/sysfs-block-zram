@@ -169,3 +169,71 @@ Contact:	Fer1d
 Description:
 		The new file is write-only; writing "all" clears the idle
 		state and the idle generation counter of every page.
+
+What:		/sys/block/zram<id>/pool_policy
+Date:		November 2026
+Description:
+		CONFIG_ZRAM_POOL_POLICY only, mode 0600. Read/write four decimal
+		unsigned integers: enabled low_mib high_mib min_age_seconds.
+		Default: 0 512 768 60. Require enabled in {0,1},
+		0 < low_mib < high_mib <= UINT_MAX, positive age <= UINT_MAX.
+		Updates are atomic and advance demand sequence, including rewrites.
+		Thresholds measure physical zsmalloc allocated pages in MiB, not
+		compressed data bytes, logical occupancy or disksize. Reset disables
+		policy but preserves configured thresholds and age. Build/runtime
+		defaults disabled. No debugfs dependency, no automatic BIO submission.
+
+What:		/sys/block/zram<id>/pool_demand
+Date:		November 2026
+Description:
+		CONFIG_ZRAM_POOL_POLICY only, mode 0400. One coherent line of named
+		decimal fields in this order:
+		sequence N instance N generation N enabled N initialized N backing N
+		active N physical_pool_bytes N low_mib N high_mib N min_age_seconds N
+		(The line above is wrapped here only.) Hysteresis asserts at >= high,
+		clears at <= low. Disabled/uninitialized/no backing means inactive.
+		Sequence is nonzero; changes on configuration, lifecycle or active
+		state changes and on active aging retries. Counters/bytes alone do
+		not advance it. Identity is the v1 STATUS instance/generation.
+		Read initially, poll for POLLPRI/POLLERR, seek to zero and reread.
+		sysfs_notify events coalesce: compare sequence AND lifecycle identity.
+		Reads do not consume demand; they may refresh state and notify once
+		if a pending transition is discovered. No queue/replay guarantee.
+		Allocation/free/compaction and lifecycle events coalesce into work.
+		Disabled hot paths do not queue sampling. There is no periodic idle
+		poll: only while demand is active, an aging timer refreshes sequence
+		every min_age_seconds (saturated to MAX_JIFFY_OFFSET ticks), allowing
+		bounded backoff when no cold candidates exist. Workers do not scan
+		or writeback. Removal drains both event and age work before free.
+
+		Userspace writeback uses <linux/zram_policy.h>:
+		ZRAM_IOC_WB_POLICY_EXEC = _IOWR('Z', 0x22, struct zram_wb_policy_exec)
+		(0xc0e05a22), CAP_SYS_ADMIN and a writable descriptor required.
+		Fixed 224 bytes native/compat: embedded v1 EXEC at offset 0, then
+		aligned u64 demand_sequence@160, max_scanned_pages@168,
+		min_age_ns@176, start_index@184, next_index(output)@192,
+		reserved[3]@200. exec.size=224, exec.version=1 (policy version).
+		mode/page_index/idle_count, all outputs and reserved must be zero.
+		Nonzero request_id and demand_sequence required. Limits must satisfy
+		0 < installed <= attempted <= scanned < U64_MAX. Age must be positive
+		and <= S64_MAX; start_index <= U32_MAX and within initialized disk.
+		Cold selection uses known boottime age >= min_age_ns, at least the
+		configured age. Unknown/future timestamps are skipped. Resident
+		non-SAME/non-WB/non-UNDER_WB candidates do not require IDLE or any
+		cumulative idle markings. Selection is rechecked under slot lock;
+		read/free/replacement invalidates pending B installs as in v1.
+		At most one wrapping traversal per call; next_index is a continuation
+		cursor, not a snapshot. Every visited slot counts against scanned.
+		Stop reason 11 means scanned limit; installation/attempt limits take
+		precedence on ties. Other outputs/error/accounting semantics are v1.
+		Malformed input returns syscall errno. Accepted stale sequence or
+		identity returns op_errno=-ESTALE (stop STALE); inactive demand gives
+		-EAGAIN (NOT_READY); too-small age/invalid device cursor gives -EINVAL
+		(ERROR). Accepted operations return syscall success with result.
+		EFAULT copyout may follow effects: never blindly replay a request.
+		v1 EXEC/STATUS structs, commands and capability bits are unchanged.
+		A limited batch does not itself advance sequence: userspace may run
+		a finite, explicitly budgeted episode using the same sequence and
+		next_index while active, and must reread after stale/inactive/aging.
+		No-candidate completion should wait for the next age/event sequence,
+		not spin. Demand is advisory, not an automatic writeback promise.

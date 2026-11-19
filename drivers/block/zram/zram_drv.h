@@ -19,6 +19,7 @@
 #include <linux/mutex.h>
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
+#include <linux/workqueue.h>
 
 #include "zcomp.h"
 
@@ -82,7 +83,7 @@ struct zram_table_entry {
 		unsigned long element;
 	};
 	unsigned long flags;
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_ACCESS_TRACKING)
 	ktime_t ac_time;
 #endif
 };
@@ -133,6 +134,16 @@ struct zram {
 	unsigned long limit_pages;
 
 	struct zram_stats stats;
+#ifdef CONFIG_ZRAM_POOL_POLICY
+	/* Lock order: init_lock -> policy_lock -> wb_mutex -> slot lock. */
+	struct mutex policy_lock;
+	struct work_struct policy_work;
+	struct delayed_work policy_age_work;
+	u64 demand_sequence, demand_bytes, demand_instance, demand_generation;
+	u32 policy_low_mib, policy_high_mib, policy_age_seconds;
+	bool policy_enabled, demand_active, demand_initialized, demand_backing;
+	bool policy_removing;
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
 	/* Protected by init_lock; deliberately outside resettable statistics. */
 	u64 wb_instance;
@@ -160,10 +171,24 @@ struct zram {
 	unsigned long *bitmap;
 	unsigned long nr_pages;
 #endif
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+#if defined(CONFIG_ZRAM_MEMORY_TRACKING) || defined(CONFIG_ZRAM_POOL_OBSERVER)
 	struct dentry *debugfs_dir;
 #endif
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+	/* Lock order: observer_lock -> init_lock. */
+	struct mutex observer_lock;
+	u64 observer_cursor;
+	bool observer_high;
+#endif
 };
+
+#ifdef CONFIG_ZRAM_POOL_OBSERVER
+void zram_pool_observer_register(struct zram *zram);
+#ifdef CONFIG_ZRAM_WRITEBACK
+/* Under init_lock. Returns -EBUSY if contended, otherwise 0/1. */
+int zram_pool_observer_slot(struct zram *zram, u32 index, s64 *access_ns);
+#endif
+#endif
 
 static inline unsigned int zram_idle_count(struct zram *zram, u32 index)
 {

@@ -291,6 +291,35 @@ a single line of text and contains the following stats separated by whitespace:
 
 * Optional Feature
 
+= Physical pool observer
+
+CONFIG_ZRAM_POOL_OBSERVER defaults off and requires DEBUG_FS. When enabled,
+root can read /sys/kernel/debug/zram/zramX/pool_observer (with debugfs mounted).
+This is diagnostic output, not a stable ABI. There is no polling worker, PSI
+integration, writeback action, or writable control.
+
+physical_pool_bytes is the zsmalloc page count times PAGE_SIZE. It does not
+include the slot table or backing storage. Sampled pressure enters high at
+768 MiB or above, returns to low at 512 MiB or below, and retains its last
+sampled state in between. Each device starts in low pressure on initialization;
+reset clears the latch and scan cursor. Reads of an uninitialized device
+report pressure uninitialized and do not touch a pool or table.
+
+With CONFIG_ZRAM_WRITEBACK, each initialized sample visits at most 1024 slots
+from a per-device rotating cursor, skipping busy slots without waiting for
+slot locks. eligible_slots counts matches of the existing filtered-idle
+predicate with at least one cumulative idle marking. It does not require
+backing to be attached and is not a whole-device estimate, a prediction of
+reclaimable bytes, or an authorization to write. Pool occupancy and individual
+slots can change during sampling. Without writeback, eligibility is unsupported.
+
+With CONFIG_ZRAM_MEMORY_TRACKING as well, eligible_aged_slots counts eligible
+slots whose recorded last access is at least 60 seconds before the sample,
+using the existing boottime timestamp (including suspend). Missing timestamps
+and ones newer than the sample are counted in eligible_age_unknown_slots.
+Without both options the observer reports access_age unsupported; idle markings
+are never treated as elapsed time. The observer does not mark slots idle.
+
 = writeback
 
 With CONFIG_ZRAM_WRITEBACK, zram can write idle/incompressible page

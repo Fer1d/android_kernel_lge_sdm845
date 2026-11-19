@@ -78,5 +78,16 @@ or deployment validation. 32-bit checks cover userspace ABI, not a 32-bit
 kernel; the existing slot-flag layout is not changed in this phase. Full
 kernel builds and device acceptance remain separate manual gates.
 
+Host-only physical pool observer tests
+--------------------------------------
+  make -C tools/testing/selftests/zram observer-host-test
+  make -C tools/testing/selftests/zram observer-host-test-sanitize
+
+These execute the observer sampler and existing filtered-idle predicate with
+simulated 4/16/64 KiB pages. They cover watermark edges, reset and re-init,
+no backing, bounded rotating scans with two concurrent readers and busy slots,
+and age versus eligibility with optional config combinations. Real debugfs
+lifetimes and kernel concurrency are not simulated. No device is accessed.
+
 For more information please refer:
 kernel-source-tree/Documentation/blockdev/zram.txt

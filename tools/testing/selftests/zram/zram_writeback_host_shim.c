@@ -25,6 +25,9 @@ typedef unsigned int fmode_t;
 
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t s64;
+#define S64_MAX INT64_MAX
+#define ktime_set(s, ns) ((s) * 1000000000LL + (ns))
 typedef long long atomic64_t;
 #define CONFIG_ZRAM_WRITEBACK 1
 #define PAGE_SIZE (1UL << PAGE_SHIFT)
@@ -50,6 +53,7 @@ struct bio {
 struct zram_table_entry {
 	union { unsigned long handle, element; };
 	unsigned long flags;
+	s64 ac_time;
 };
 struct zram_stats {
 	atomic64_t bd_writes, bd_count, pages_stored, huge_pages, same_pages;
@@ -63,9 +67,21 @@ struct zram {
 	u64 bd_wb_limit;
 	int wb_limit_lock, wb_mutex, init_lock;
 	u64 disksize, wb_instance, wb_generation;
+	struct { int kobj; } *disk;
+	u64 demand_bytes, demand_sequence, demand_instance, demand_generation;
+	unsigned int policy_low_mib, policy_high_mib, policy_age_seconds;
+	bool policy_enabled, demand_active, demand_initialized, demand_backing;
 	void *bdev, *mem_pool, *backing_dev;
 	struct zram_stats stats;
 };
+
+#define disk_to_dev(d) (d)
+static unsigned int notifications;
+static void sysfs_notify(void *kobj, void *group, const char *name)
+{
+	(void)kobj; (void)group; assert(!strcmp(name, "pool_demand"));
+	notifications++;
+}
 
 static unsigned int signal_at, signal_calls, add_fail_at, submit_count;
 static unsigned int live_bios, live_pages, live_handles;
@@ -234,7 +250,7 @@ static void *memchr_inv(const void *p, int c, size_t n)
 			return (void *)(b + i);
 	return NULL;
 }
-static u64 ktime_get_ns(void) { static u64 now; return ++now; }
+static u64 ktime_get_ns(void) { static u64 now = 100; return ++now; }
 static u64 random_script[4], random_count, random_pos;
 static u64 get_random_u64(void)
 {
@@ -244,7 +260,8 @@ static u64 get_random_u64(void)
 	return ++cookie;
 }
 static u64 atomic64_read(atomic64_t *v) { return *v; }
-static unsigned long zs_get_total_pages(void *pool) { return 7; }
+static unsigned long sampled_pool_pages = 7;
+static unsigned long zs_get_total_pages(void *pool) { (void)pool; return sampled_pool_pages; }
 #define dev_to_disk(dev) (&(dev)->disk)
 static unsigned int alloc_fail_at, alloc_calls, live_allocs;
 static int read_fail_index = -1;
@@ -1129,7 +1146,7 @@ static void test_exec_validation(void)
 	assert(ioctl_call(&zram, ZRAM_IOC_WB_EXEC, &req, FMODE_WRITE, false) == -EFAULT);
 	copyin_fault = false;
 	assert(ioctl_call(&zram, _IO('Z', 0x20), &req, FMODE_WRITE, false) == -EINVAL);
-	assert(ioctl_call(&zram, _IO('Z', 0x22), &req, FMODE_WRITE, false) == -ENOIOCTLCMD);
+	assert(ioctl_call(&zram, _IO('Z', 0x23), &req, FMODE_WRITE, false) == -ENOIOCTLCMD);
 	assert(!copyouts && !submit_count && !live_pages && !live_allocs);
 	/* Page zero is legal; nonzero page index must not truncate into zero. */
 	req = base; req.mode = ZRAM_WB_MODE_PAGE; req.idle_count = 0;
@@ -1234,7 +1251,7 @@ static void test_fops_routing(void)
 			assert(req.installed_pages == 1 && req.submitted_pages == 1);
 			assert(req.stop_reason == ZRAM_WB_STOP_INSTALLED_LIMIT);
 			assert(!req.op_errno && copyouts == 2 && submit_count == 1);
-			assert(ioctl_route(ops, &zram, _IO('Z', 0x22), &req,
+			assert(ioctl_route(ops, &zram, _IO('Z', 0x23), &req,
 					   FMODE_WRITE, compat) == -ENOIOCTLCMD);
 			finish(&zram);
 		}
@@ -1267,14 +1284,110 @@ static void test_copyout_compat(void)
 	}
 }
 #endif
+static void test_demand(void)
+{
+	struct zram z;
+	int fake_disk = 0;
+	reset(&z);
+	z.disk = (void *)&fake_disk;
+	z.policy_low_mib = 1;
+	z.policy_high_mib = 2;
+	z.disksize = 8ULL << PAGE_SHIFT;
+	z.backing_dev = &z;
+	zram_policy_sample(&z, false);
+	assert(!z.demand_active && z.demand_sequence);
+	z.policy_enabled = true;
+	/* Shim physical-pool sampler is stats.pages_stored. */
+	sampled_pool_pages = (2ULL << 20) >> PAGE_SHIFT;
+	zram_policy_sample(&z, false);
+	assert(z.demand_active);
+	u64 sequence = z.demand_sequence;
+	sampled_pool_pages = (3ULL << 19) >> PAGE_SHIFT;
+	zram_policy_sample(&z, false);
+	assert(z.demand_active && z.demand_sequence == sequence);
+	zram_policy_sample(&z, true);
+	assert(z.demand_sequence == sequence + 1); /* aging/config epoch */
+	sampled_pool_pages = (1ULL << 20) >> PAGE_SHIFT;
+	zram_policy_sample(&z, false);
+	assert(!z.demand_active);
+	sampled_pool_pages = (2ULL << 20) >> PAGE_SHIFT;
+	zram_policy_sample(&z, false);
+	assert(z.demand_active);
+	z.backing_dev = NULL;
+	zram_policy_sample(&z, false);
+	assert(!z.demand_active);
+	sequence = z.demand_sequence;
+	z.wb_generation++;
+	zram_policy_sample(&z, false);
+	assert(z.demand_sequence == sequence + 1);
+	sampled_pool_pages = 7;
+	finish(&z);
+}
+
+static void test_policy(void)
+{
+	struct zram z;
+	struct zram_wb_policy_exec p = {0};
+
+	p.exec.size = sizeof(p);
+	p.exec.version = ZRAM_WB_POLICY_ABI_VERSION;
+	p.exec.request_id = 1;
+	p.exec.max_installed_pages = 2;
+	p.exec.max_attempt_pages = 2;
+	p.max_scanned_pages = 4;
+	p.demand_sequence = 1;
+	p.min_age_ns = 1;
+	assert(!zram_wb_policy_validate(&p));
+	p.max_scanned_pages = U64_MAX;
+	assert(zram_wb_policy_validate(&p) == -EINVAL);
+	p.max_scanned_pages = 4;
+	p.next_index = 1;
+	assert(zram_wb_policy_validate(&p) == -EINVAL);
+	p.next_index = 0;
+	p.exec.scanned_pages = 1;
+	assert(zram_wb_policy_validate(&p) == -EINVAL);
+	p.exec.scanned_pages = 0;
+	reset(&z);
+	z.disksize = 8ULL << PAGE_SHIFT;
+	for (unsigned int i = 0; i < 8; i++) {
+		object(&z, i);
+		/* No IDLE flag, no compress-low filter and no cumulative markings. */
+		z.table[i].flags &= ~(BIT(ZRAM_COMPRESS_LOW) | ZRAM_IDLE_COUNT_MASK);
+		z.stats.lowratio_pages--;
+		z.table[i].ac_time = 1;
+	}
+	z.table[6].ac_time = 0; /* unknown */
+	z.table[7].ac_time = INT64_MAX; /* future */
+	p.start_index = 6;
+	assert(!zram_writeback_engine_policy(&z, &p.exec, &p));
+	assert(p.exec.scanned_pages == 4 && p.exec.installed_pages == 2);
+	assert(p.exec.submitted_pages == 2 && p.next_index == 2);
+	assert(p.exec.stop_reason == ZRAM_WB_STOP_INSTALLED_LIMIT);
+	finish(&z);
+	reset(&z);
+	z.disksize = 8ULL << PAGE_SHIFT;
+	memset(&p.exec.scanned_pages, 0,
+	       sizeof(p.exec) - offsetof(struct zram_wb_exec, scanned_pages));
+	p.start_index = 7;
+	p.next_index = 0;
+	assert(!zram_writeback_engine_policy(&z, &p.exec, &p));
+	assert(p.exec.scanned_pages == 4 && !p.exec.submitted_pages);
+	assert(p.exec.stop_reason == ZRAM_WB_STOP_SCANNED_LIMIT && p.next_index == 3);
+	finish(&z);
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
-	puts("TAP version 13\n1..12");
+	puts("TAP version 13\n1..14");
 #else
-	puts("TAP version 13\n1..6");
+	puts("TAP version 13\n1..8");
 #endif
+	test_demand();
+	puts("ok - actual demand hysteresis, config/age and lifecycle sequences");
+	test_policy();
+	puts("ok - cold policy actual selector, wrapping cursor, scan bound and strict validation");
 	test_budget();
 	puts("ok 1 - extracted reserve/refund budget units and disabled limit");
 	test_flush();

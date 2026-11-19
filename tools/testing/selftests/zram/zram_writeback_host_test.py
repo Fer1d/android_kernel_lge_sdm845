@@ -101,7 +101,7 @@ def main():
                             "-Werror", "-Wno-unused-parameter", "-Wno-sign-compare",
                             "-fno-omit-frame-pointer", "-fno-pie",
                             "-no-pie", "-DCONFIG_ZRAM_WRITEBACK_IOCTL=1",
-                            "-DCONFIG_COMPAT=1", "-DPAGE_SHIFT=" + str(shift),
+                            "-DCONFIG_COMPAT=1", "-DCONFIG_ZRAM_ACCESS_TRACKING=1", "-DPAGE_SHIFT=" + str(shift),
                             "-I", str(build), "-I", str(ROOT / "include/uapi"),
                             str(shim), "-o", str(exe)]
             if args.sanitize:
@@ -133,7 +133,11 @@ def layout_checks(cc, build):
     asm.mkdir()
     for name in ("types", "ioctl", "posix_types", "bitsperlong"):
         (asm / (name + ".h")).write_text("#include <asm-generic/" + name + ".h>\n")
-    checks = ['#include <linux/zram.h>',
+    checks = ['#include <linux/zram.h>', '#include <linux/zram_policy.h>',
+              '_Static_assert(sizeof(struct zram_wb_policy_exec) == 224, "policy size");',
+              '_Static_assert(ZRAM_IOC_WB_POLICY_EXEC == 0xc0e05a22U, "policy command");',
+              '_Static_assert(__builtin_offsetof(struct zram_wb_policy_exec, demand_sequence) == 160, "policy offset");',
+              '_Static_assert(__alignof__(struct zram_wb_policy_exec) == 8, "policy alignment");',
               '#define OFF(t, f, n) _Static_assert(__builtin_offsetof(struct t, f) == n, #f)',
               '_Static_assert(sizeof(struct zram_wb_exec) == 160, "exec size");',
               '_Static_assert(sizeof(struct zram_wb_status) == 192, "status size");',
@@ -155,6 +159,8 @@ def layout_checks(cc, build):
                          huge_pages=96, lowratio_pages=104, bd_count_pages=112,
                          bd_reads_pages=120, bd_writes_pages=128,
                          compr_data_bytes=136, mem_used_bytes=144, reserved_out=152)
+    for field, offset in dict(exec=0, demand_sequence=160, max_scanned_pages=168, min_age_ns=176, start_index=184, next_index=192, reserved=200).items():
+        checks.append(f"OFF(zram_wb_policy_exec, {field}, {offset});")
     for struct, fields in (("zram_wb_exec", exec_fields), ("zram_wb_status", status_fields)):
         checks.extend(f"OFF({struct}, {field}, {offset});" for field, offset in fields.items())
     source = build / "layout.c"
@@ -275,8 +281,10 @@ def extract(text):
                  "zram_free_page", "zram_wb_stop") + REQUIRED:
         functions.append(function(text, name))
     for name in ("init_done", "dev_to_zram", "writeback_parse_filter",
-                 "zram_writeback_match", "zram_writeback_engine", "writeback_store"):
+                 "zram_writeback_match", "zram_wb_policy_match", "zram_writeback_engine_policy", "zram_writeback_engine", "writeback_store"):
         functions.append(function(text, name))
+    functions.append(function((SOURCE.parent / "zram_pool_policy.c").read_text(), "zram_wb_policy_validate"))
+    functions.append(function((SOURCE.parent / "zram_pool_policy.c").read_text(), "zram_policy_sample"))
     functions.append("#ifdef CONFIG_ZRAM_WRITEBACK_IOCTL")
     for name in ("zram_wb_new_instance", "zram_wb_generation_advance"):
         functions.append(function(text, name))
@@ -289,7 +297,7 @@ def extract(text):
     functions.append(function(text, "zram_ioctl"))
     functions.append("#ifdef CONFIG_COMPAT\n" + function(text, "zram_compat_ioctl") + "\n#endif")
     functions.append(actual_fops(text))
-    return declarations + "\n" + "\n\n".join(functions) + "\n"
+    return "#include <linux/zram_policy.h>\n#define ktime_get_boottime ktime_get_ns\n#define ktime_to_ns(x) (x)\nstatic void zram_policy_event(struct zram *zram) { (void)zram; }\n" + declarations + "\n" + "\n\n".join(functions) + "\n"
 
 
 if __name__ == "__main__":
