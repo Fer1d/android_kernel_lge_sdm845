@@ -1,0 +1,29 @@
+G7 first-stage cmdline bridge host regression
+============================================
+
+Run from this directory:
+
+    make run_tests OUTPUT=/absolute/path/to/new/test-output
+
+The test includes the production fs/proc/g7_coexist_cmdline.h directly.
+It covers 30 input groups plus 48 output-capacity boundary checks, without
+accessing devices, mounting filesystems or executing Android init.
+
+The bridge retains ramdisk unpacking when INITRAMFS_IGNORE_SKIP_FLAG is set,
+then derives a /proc/cmdline view from exact bare skip_initramfs tokens.
+PROC_CMDLINE_APPEND_FORCE_NORMAL_BOOT requires the ignore option. Existing
+force-normal keys, quote syntax, the -- delimiter and capacity are checked.
+Conflicts reject the derived view; the kernel logs a warning and exposes the
+original saved command line. This fallback does NOT guarantee Recovery mode.
+The original saved_command_line and unrelated arguments remain unchanged.
+
+A compatible two-stage boot ramdisk, first-stage fstab and matching base/overlay
+DTs are required. Disabling DT fstab nodes without file-based replacements is
+not a standalone boot configuration. Hardware properties in a stock DTBO may
+differ from this tree; validate the final merged tree, not source status alone.
+In particular, disabling the source OP node does not convert it to EROFS or
+change its /oem/OP path into a stock overlay's /mnt/product/OP path.
+
+These changes were validated as an isolated build based on c39cb3403bcb;
+the separate EROFS readlink callback fix is already recorded by bdafa2fca25e.
+Host test success is not proof of bootloader acceptance or device boot success.

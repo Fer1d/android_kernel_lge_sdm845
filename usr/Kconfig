@@ -2,6 +2,16 @@
 # Configuration for initramfs
 #
 
+config INITRAMFS_IGNORE_SKIP_FLAG
+	bool "Ignore the bare skip_initramfs boot flag"
+	depends on BLK_DEV_INITRD
+	default n
+	help
+	  Keep the normal initramfs unpacking path even when the bootloader
+	  supplies skip_initramfs. No disable_skip_initramfs token is needed.
+	  This does not modify the saved kernel command line.
+	  If unsure, say N.
+
 config INITRAMFS_SOURCE
 	string "Initramfs source file(s)"
 	default ""

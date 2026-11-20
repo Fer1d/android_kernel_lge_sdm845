@@ -28,6 +28,19 @@ config PROC_FS
 	  This option will enlarge your kernel by about 67 KB. Several
 	  programs depend on this, so everyone should say Y here.
 
+config PROC_CMDLINE_APPEND_FORCE_NORMAL_BOOT
+	bool "Expose the G7 normal-boot initramfs bridge in /proc/cmdline"
+	depends on PROC_FS && INITRAMFS_IGNORE_SKIP_FLAG
+	default n
+	help
+	  In the read-only proc view, replace exact unquoted skip_initramfs
+	  tokens with want_initramfs and append androidboot.force_normal_boot=1
+	  only when such a token was found and the force key is absent.
+	  Existing force=1 is retained. Conflicting or duplicate force keys,
+	  malformed input and insufficient capacity warn and expose the original
+	  command line instead. The saved command line is never changed.
+	  If unsure, say N.
+
 config PROC_KCORE
 	bool "/proc/kcore support" if !ARM
 	depends on PROC_FS && MMU
