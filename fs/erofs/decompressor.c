@@ -117,16 +117,16 @@ static int z_erofs_lz4_prepare_dstpages(struct z_erofs_decompress_req *rq,
 }
 
 static void *z_erofs_lz4_handle_inplace_io(struct z_erofs_decompress_req *rq,
-			void *inpage, unsigned int *inputmargin, int *maptype,
+			void *inpage, u8 *dst, unsigned int *inputmargin,
+			unsigned int nrpages_in, int *maptype,
 			bool support_0padding)
 {
-	unsigned int nrpages_in, nrpages_out;
-	unsigned int ofull, oend, inputsize, total, i, j;
+	unsigned int nrpages_out;
+	unsigned int ofull, oend, inputsize, total, i;
 	struct page **in;
 	void *src, *tmp;
 
 	inputsize = rq->inputsize;
-	nrpages_in = PAGE_ALIGN(inputsize) >> PAGE_SHIFT;
 	oend = rq->pageofs_out + rq->outputsize;
 	ofull = PAGE_ALIGN(oend);
 	nrpages_out = ofull >> PAGE_SHIFT;
@@ -137,12 +137,13 @@ static void *z_erofs_lz4_handle_inplace_io(struct z_erofs_decompress_req *rq,
 		    ofull - oend < LZ4_DECOMPRESS_INPLACE_MARGIN(inputsize))
 			goto docopy;
 
-		for (i = 0; i < nrpages_in; ++i) {
-			DBG_BUGON(rq->in[i] == NULL);
-			for (j = 0; j < nrpages_out - nrpages_in + i; ++j)
-				if (rq->out[j] == rq->in[i])
-					goto docopy;
-		}
+		/* Use one mapping so the source is at the end of the output. */
+		for (i = 0; i < nrpages_in; ++i)
+			if (rq->out[nrpages_out - nrpages_in + i] != rq->in[i])
+				goto docopy;
+		kunmap_atomic(inpage);
+		*maptype = 3;
+		return dst + ((nrpages_out - nrpages_in) << PAGE_SHIFT);
 	}
 
 	if (nrpages_in <= 1) {
@@ -188,10 +189,11 @@ docopy:
 }
 
 static int z_erofs_lz4_decompress_mem(struct z_erofs_decompress_req *rq,
-				      u8 *out)
+					      u8 *dst)
 {
+	const unsigned int nrpages_in = PAGE_ALIGN(rq->inputsize) >> PAGE_SHIFT;
 	unsigned int inputmargin;
-	u8 *headpage, *src;
+	u8 *headpage, *src, *out = dst + rq->pageofs_out;
 	bool support_0padding;
 	int ret, maptype;
 
@@ -215,8 +217,8 @@ static int z_erofs_lz4_decompress_mem(struct z_erofs_decompress_req *rq,
 	}
 
 	rq->inputsize -= inputmargin;
-	src = z_erofs_lz4_handle_inplace_io(rq, headpage, &inputmargin,
-					    &maptype, support_0padding);
+	src = z_erofs_lz4_handle_inplace_io(rq, headpage, dst, &inputmargin,
+					  nrpages_in, &maptype, support_0padding);
 	if (IS_ERR(src))
 		return PTR_ERR(src);
 
@@ -247,10 +249,11 @@ static int z_erofs_lz4_decompress_mem(struct z_erofs_decompress_req *rq,
 	if (maptype == 0) {
 		kunmap_atomic(src);
 	} else if (maptype == 1) {
-		vm_unmap_ram(src, PAGE_ALIGN(rq->inputsize) >> PAGE_SHIFT);
+		vm_unmap_ram(src, nrpages_in);
 	} else if (maptype == 2) {
 		erofs_put_pcpubuf(src);
-	} else {
+	} else if (maptype != 3) {
+		/* Type 3 borrows the destination mapping, released by the caller. */
 		DBG_BUGON(1);
 		return -EFAULT;
 	}
@@ -290,7 +293,7 @@ static int z_erofs_lz4_decompress(struct z_erofs_decompress_req *rq,
 	dst_maptype = 2;
 
 dstmap_out:
-	ret = z_erofs_lz4_decompress_mem(rq, dst + rq->pageofs_out);
+	ret = z_erofs_lz4_decompress_mem(rq, dst);
 
 	if (!dst_maptype)
 		kunmap_atomic(dst);
