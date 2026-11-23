@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Host simulation only. actual_helpers.h is extracted afresh from the driver.
- * No devices, threads or kernel execution. Assertions are runtime checks.
+ * No devices or kernel execution. Assertions are runtime checks.
  */
 #include <assert.h>
 #include <errno.h>
@@ -46,7 +46,9 @@ struct bio_vec { struct page *bv_page; unsigned int bv_len, bv_offset; };
 struct bio {
 	struct bio_vec *bi_io_vec;
 	unsigned int bi_max_vecs, count;
-	void *bi_bdev;
+	void *bi_bdev, *bi_private;
+	void (*bi_end_io)(struct bio *bio);
+	int bi_error;
 	struct { unsigned long bi_sector; } bi_iter;
 	bool active;
 };
@@ -84,18 +86,83 @@ static void sysfs_notify(void *kobj, void *group, const char *name)
 }
 
 static unsigned int signal_at, signal_calls, add_fail_at, submit_count;
-static unsigned int live_bios, live_pages, live_handles;
+static unsigned int live_bios, peak_live_bios, live_pages, live_handles;
 static int io_error;
+static bool interrupt_bio_build;
 static void (*during_io)(void);
+static void (*during_bio_build)(void);
+static void (*before_end_io)(unsigned int serial);
 static void (*during_read)(unsigned int index);
 static void (*during_resched)(void);
 static struct zram *active_zram;
 static bool handles[SLOTS + 1];
 static unsigned int submitted_sizes[128];
 static unsigned long submitted_blocks[SLOTS];
+static struct {
+	struct bio *bio;
+	int error;
+} pending_bios[128];
+static unsigned int completion_order[128], nr_completed;
+static unsigned int pending_count, peak_pending;
+static bool defer_bios, defer_worker, newest_first;
+static int completion_errors[128];
+static bool zram_wb_reap_one(void);
 #define current NULL
 static void spin_lock(int *lock) { assert(!*lock); *lock = 1; }
 static void spin_unlock(int *lock) { assert(*lock); *lock = 0; }
+#define DEFINE_SPINLOCK(name) int name
+#define spin_lock_irqsave(lock, flags) do { (flags) = 0; spin_lock(lock); } while (0)
+#define spin_unlock_irqrestore(lock, flags) do { (void)(flags); spin_unlock(lock); } while (0)
+#define READ_ONCE(value) (value)
+#define WRITE_ONCE(value, new_value) ((value) = (new_value))
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(name) struct list_head name = { &(name), &(name) }
+#define list_first_entry(head, type, member) container_of((head)->next, type, member)
+static bool list_empty(const struct list_head *head) { return head->next == head; }
+static void list_add_tail(struct list_head *node, struct list_head *head)
+{
+	node->prev = head->prev;
+	node->next = head;
+	head->prev->next = node;
+	head->prev = node;
+}
+static void list_del(struct list_head *node)
+{
+	node->prev->next = node->next;
+	node->next->prev = node->prev;
+	node->prev = node->next = NULL;
+}
+
+typedef int wait_queue_head_t;
+#define DECLARE_WAIT_QUEUE_HEAD(name) wait_queue_head_t name
+#define init_waitqueue_head(queue) (*(queue) = 0)
+static void wake_up(wait_queue_head_t *queue) { (void)queue; }
+#define wake_up_all(queue) wake_up(queue)
+#define wake_up_interruptible(queue) wake_up(queue)
+static bool host_progress(void);
+static bool signal_pending(void *task);
+#define wait_event(queue, condition) do { \
+	(void)(&(queue)); \
+	while (!(condition)) \
+		assert(host_progress()); \
+} while (0)
+#define wait_event_interruptible(queue, condition) ({ \
+	int result = 0; \
+	(void)(&(queue)); \
+	while (!(condition)) { \
+		if (signal_pending(current)) { result = -EINTR; break; } \
+		assert(host_progress()); \
+	} \
+	result; \
+})
+static bool stop_worker;
+static bool kthread_should_stop(void) { return stop_worker; }
+#define ERR_PTR(err) ((void *)(intptr_t)(err))
+#define PTR_ERR(ptr) ((long)(intptr_t)(ptr))
+#define IS_ERR(ptr) ((uintptr_t)(ptr) >= (uintptr_t)-4095)
 static bool signal_pending(void *task)
 {
 	(void)task;
@@ -152,7 +219,8 @@ static void bio_init(struct bio *bio)
 {
 	memset(bio, 0, sizeof(*bio));
 	bio->active = true;
-	live_bios++;
+	if (++live_bios > peak_live_bios)
+		peak_live_bios = live_bios;
 }
 static void bio_set_op_attrs(struct bio *bio, int op, int flags)
 {
@@ -166,12 +234,16 @@ static unsigned int bio_add_page(struct bio *bio, struct page *page,
 		return 0;
 	assert(bio->count < bio->bi_max_vecs);
 	bio->bi_io_vec[bio->count++] = (struct bio_vec){ page, len, offset };
+	if (interrupt_bio_build)
+		signal_at = 1;
+	if (during_bio_build)
+		during_bio_build();
 	return len;
 }
-static int submit_bio_wait(struct bio *bio)
+static void record_bio(struct bio *bio)
 {
 	assert(bio->active && bio->count && active_zram);
-	assert(submit_count < 128);
+	assert(submit_count < sizeof(submitted_sizes) / sizeof(submitted_sizes[0]));
 	submitted_sizes[submit_count++] = bio->count;
 	unsigned long first = bio->bi_iter.bi_sector / SECTORS_PER_PAGE;
 	assert(first && first + bio->count <= BLOCKS);
@@ -184,10 +256,60 @@ static int submit_bio_wait(struct bio *bio)
 		assert(index < SLOTS);
 		submitted_blocks[index] = block;
 	}
+}
+
+static void deliver_bio(unsigned int serial)
+{
+	struct bio *bio = pending_bios[serial].bio;
+
+	assert(bio && bio->active && bio->bi_end_io && pending_count);
+	pending_bios[serial].bio = NULL;
+	pending_count--;
+	completion_order[nr_completed++] = serial;
+	if (before_end_io)
+		before_end_io(serial);
+	bio->bi_error = pending_bios[serial].error;
+	bio->bi_end_io(bio);
+}
+
+static void submit_bio(struct bio *bio)
+{
+	unsigned int serial = submit_count;
+
+	record_bio(bio);
 	if (during_io)
 		during_io();
-	return io_error;
+	pending_bios[serial].bio = bio;
+	pending_bios[serial].error = completion_errors[serial] ?: io_error;
+	if (++pending_count > peak_pending)
+		peak_pending = pending_count;
+	if (!defer_bios) {
+		deliver_bio(serial);
+		if (!defer_worker)
+			assert(zram_wb_reap_one());
+	}
 }
+
+static bool deliver_pending_bio(void)
+{
+	for (unsigned int i = 0; i < submit_count; i++) {
+		unsigned int serial = newest_first ? submit_count - 1 - i : i;
+
+		if (pending_bios[serial].bio) {
+			deliver_bio(serial);
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Cooperative dispatch: run the real worker's nonblocking iteration at a
+ * modeled wait, and deliver BIO callbacks separately from slot installation. */
+static bool host_progress(void)
+{
+	return zram_wb_reap_one() || deliver_pending_bio();
+}
+
 static void bio_reset(struct bio *bio)
 {
 	assert(bio->active && live_bios);
@@ -358,16 +480,22 @@ static int zram_read_from_zspool(struct zram *zram, struct page *page, u32 index
 static void reset(struct zram *zram)
 {
 	assert(!live_bios && !live_pages && !live_handles && !live_allocs);
+	assert(!pending_count && nr_completed == submit_count);
 	memset(zram, 0, sizeof(*zram));
 	memset(handles, 0, sizeof(handles));
 	memset(submitted_blocks, 0, sizeof(submitted_blocks));
 	zram->nr_pages = BLOCKS;
 	signal_at = signal_calls = add_fail_at = submit_count = 0;
+	nr_completed = peak_pending = peak_live_bios = 0;
+	defer_bios = defer_worker = newest_first = interrupt_bio_build = false;
+	memset(completion_errors, 0, sizeof(completion_errors));
 	io_error = 0;
 	alloc_fail_at = alloc_calls = 0;
 	read_fail_index = -1;
 	mutex_interrupted = false;
 	during_io = NULL;
+	during_bio_build = NULL;
+	before_end_io = NULL;
 	during_read = NULL;
 	during_resched = NULL;
 	active_zram = zram;
@@ -390,31 +518,6 @@ static void object(struct zram *zram, unsigned int index)
 	zram->stats.compr_data_size += 100;
 	zram->stats.lowratio_pages++;
 }
-static void prepare(struct zram *zram, struct zram_wb_batch *batch,
-		    unsigned int nr)
-{
-	memset(batch, 0, sizeof(*batch));
-	for (unsigned int i = 0; i < nr; i++) {
-		object(zram, i);
-		zram->table[i].flags |= BIT(ZRAM_UNDER_WB) | BIT(ZRAM_IDLE);
-		batch->entries[i].index = i;
-		batch->entries[i].blk_idx = alloc_block_bdev(zram);
-		assert(batch->entries[i].blk_idx);
-		batch->pages[i] = calloc(1, sizeof(struct page));
-		assert(batch->pages[i]);
-		live_pages++;
-	}
-	batch->nr = nr;
-}
-static void release_pages(struct zram_wb_batch *batch, unsigned int nr)
-{
-	for (unsigned int i = 0; i < nr; i++) {
-		assert(batch->pages[i] && live_pages);
-		free(batch->pages[i]);
-		batch->pages[i] = NULL;
-		live_pages--;
-	}
-}
 static void finish(struct zram *zram)
 {
 	for (unsigned int i = 0; i < SLOTS; i++) {
@@ -435,6 +538,8 @@ static void finish(struct zram *zram)
 	assert(!zram->stats.compr_data_size && !zram->stats.lowratio_pages);
 	assert(!zram->wb_limit_lock && !zram->wb_mutex && !zram->init_lock);
 	assert(!live_pages && !live_handles && !live_bios && !live_allocs);
+	assert(!pending_count && nr_completed == submit_count);
+	assert(!zram_wb_reap_one());
 }
 static void test_budget(void)
 {
@@ -458,46 +563,6 @@ static void test_budget(void)
 	assert(!zram.bd_wb_limit);
 	finish(&zram);
 }
-static void test_flush(void)
-{
-	const u64 unit = 1ULL << (PAGE_SHIFT - 12);
-	/* success, short grant, no grant, IO error, BIO add failure,
-	 * signal before reservation, signal after reservation. */
-	for (unsigned int scenario = 0; scenario < 7; scenario++) {
-		struct zram zram;
-		struct zram_wb_batch batch;
-		struct zram_wb_exec req = { .installed_pages = 7 };
-		reset(&zram);
-		prepare(&zram, &batch, 32);
-		zram.wb_limit_enable = true;
-		zram.bd_wb_limit = (scenario == 1 ? 31 : scenario == 2 ? 0 : 32) * unit;
-		u64 before = zram.bd_wb_limit;
-		if (scenario == 3) io_error = -EIO;
-		if (scenario == 4) add_fail_at = 17;
-		if (scenario == 5) signal_at = 1;
-		if (scenario == 6) signal_at = 2;
-		int ret = zram_wb_flush(&zram, &batch, &req);
-		unsigned int submitted = scenario == 0 || scenario == 3 ? 32 :
-					 scenario == 1 ? 31 : 0;
-		unsigned int installed = scenario == 3 ? 0 : submitted;
-		assert(ret == (scenario == 0 ? 0 : scenario >= 5 ? -EINTR : -EIO));
-		assert(!batch.nr && req.installed_pages == 7 + installed);
-		assert(zram.bd_wb_limit == before - submitted * unit);
-		assert(zram.stats.bd_writes == submitted);
-		assert(zram.stats.bd_count == installed);
-		assert(submit_count == !!submitted);
-		assert(!zram_wb_complete(&zram, &batch, 0, -EIO, &req));
-		release_pages(&batch, 32);
-		finish(&zram);
-	}
-	struct zram zram;
-	struct zram_wb_batch batch = {0};
-	struct zram_wb_exec req = {0};
-	reset(&zram);
-	assert(!zram_wb_flush(&zram, &batch, &req));
-	assert(!submit_count && !req.installed_pages && !req.submitted_pages);
-	finish(&zram);
-}
 static void invalidate(void)
 {
 	struct zram *zram = active_zram;
@@ -516,30 +581,6 @@ static void invalidate(void)
 	zram_slot_lock(zram, 3);
 	zram_clear_flag(zram, 3, ZRAM_UNDER_WB);
 	zram_slot_unlock(zram, 3);
-}
-static void test_cancel(void)
-{
-	struct zram zram;
-	struct zram_wb_batch batch;
-	struct zram_wb_exec req = {0};
-	reset(&zram);
-	prepare(&zram, &batch, 5);
-	zram.wb_limit_enable = true;
-	zram.bd_wb_limit = 5ULL << (PAGE_SHIFT - 12);
-	during_io = invalidate;
-	assert(!zram_wb_flush(&zram, &batch, &req));
-	assert(req.installed_pages == 1 && !zram.bd_wb_limit);
-	assert(req.invalidated_pages == 4 && req.submitted_pages == 5);
-	assert(!zram_allocated(&zram, 0));
-	for (unsigned int i = 1; i <= 3; i++) {
-		assert(!zram_test_flag(&zram, i, ZRAM_WB));
-		assert(zram_test_flag(&zram, i, ZRAM_COMPRESS_LOW));
-		assert(zram.table[i].flags >> ZRAM_IDLE_COUNT_SHIFT == 3);
-		assert(handles[i + 1]);
-	}
-	assert(zram_test_flag(&zram, 4, ZRAM_WB));
-	release_pages(&batch, 5);
-	finish(&zram);
 }
 static void candidates(struct zram *zram, unsigned int nr, bool sparse)
 {
@@ -561,6 +602,145 @@ static void clear_idle(struct zram *zram)
 	for (unsigned int i = 0; i < SLOTS; i++)
 		zram->table[i].flags &= ~BIT(ZRAM_IDLE);
 }
+static struct zram_wb_exec run_idle(struct zram *zram, u64 attempts, u64 installed)
+{
+	struct zram_wb_exec req = {
+		.mode = IDLE_WRITEBACK,
+		.max_attempt_pages = attempts,
+		.max_installed_pages = installed,
+	};
+	int ret;
+
+	down_read(&zram->init_lock);
+	ret = zram_writeback_engine(zram, &req);
+	up_read(&zram->init_lock);
+	assert(ret == req.op_errno);
+	return req;
+}
+
+static void test_async_window(void)
+{
+	/* Cover inline end_io, deferred worker with inline end_io, and
+	 * deferred/out-of-order end_io with a worker step between callbacks. */
+	for (unsigned int scenario = 0; scenario < 3; scenario++) {
+		struct zram zram;
+		struct zram_wb_exec req;
+		const unsigned int pages = 5 * 32 + 1;
+
+		reset(&zram);
+		candidates(&zram, pages, false);
+		defer_worker = scenario == 1;
+		defer_bios = newest_first = scenario == 2;
+		req = run_idle(&zram, pages, pages);
+		assert(!req.op_errno && req.stop_reason == ZRAM_WB_STOP_INSTALLED_LIMIT);
+		assert(req.selected_pages == pages && req.submitted_pages == pages);
+		assert(req.installed_pages == pages && !req.invalidated_pages);
+		assert(submit_count == 6 && nr_completed == 6);
+		assert(peak_live_bios == (scenario ? 4 : 1));
+		assert(peak_pending == (defer_bios ? 4 : 1));
+		assert(completion_order[0] == (defer_bios ? 3 : 0));
+		assert(completion_order[5] == (defer_bios ? 0 : 5));
+		for (unsigned int i = 0; i < pages; i++)
+			assert(submitted_blocks[i] == zram.table[i].element);
+		finish(&zram);
+	}
+}
+
+static void test_async_failure(void)
+{
+	struct zram zram;
+	struct zram_wb_exec req;
+	const unsigned int pages = 6 * 32;
+	const u64 unit = 1ULL << (PAGE_SHIFT - 12);
+
+	reset(&zram);
+	candidates(&zram, pages, false);
+	zram.wb_limit_enable = true;
+	zram.bd_wb_limit = pages * unit;
+	defer_bios = newest_first = true;
+	completion_errors[3] = -ENOSPC; /* first observed */
+	completion_errors[1] = -EIO;
+	req = run_idle(&zram, pages, pages);
+	assert(req.op_errno == -ENOSPC && req.stop_reason == ZRAM_WB_STOP_ERROR);
+	assert(req.error_stage == ZRAM_WB_STAGE_IO && !req.invalidated_pages);
+	assert(submit_count == 4 && nr_completed == 4 && peak_pending == 4);
+	for (unsigned int i = 0; i < 4; i++)
+		assert(completion_order[i] == 3 - i);
+	assert(req.submitted_pages == 128 && req.installed_pages == 64);
+	assert(zram.stats.bd_writes == 128 && zram.stats.bd_count == 64);
+	assert(zram.bd_wb_limit == (pages - 128) * unit);
+	for (unsigned int i = 0; i < pages; i++)
+		assert(zram_test_flag(&zram, i, ZRAM_WB) == (i < 128 && (i / 32) % 2 == 0));
+	clear_idle(&zram);
+	finish(&zram);
+}
+
+static void fail_during_next_build(void)
+{
+	if (submit_count == 1 && pending_count == 1)
+		deliver_bio(0);
+}
+
+static void test_async_uncommitted(void)
+{
+	struct zram zram;
+	struct zram_wb_exec req;
+	const u64 unit = 1ULL << (PAGE_SHIFT - 12);
+
+	reset(&zram);
+	candidates(&zram, 65, false);
+	zram.wb_limit_enable = true;
+	zram.bd_wb_limit = 65 * unit;
+	defer_bios = true;
+	completion_errors[0] = -EIO;
+	during_bio_build = fail_during_next_build;
+	req = run_idle(&zram, 65, 65);
+	assert(req.op_errno == -EIO && req.stop_reason == ZRAM_WB_STOP_ERROR);
+	assert(req.error_stage == ZRAM_WB_STAGE_IO && !req.invalidated_pages);
+	/* The second BIO already reserved quota, but hadn't committed. */
+	assert(req.selected_pages == 64 && req.submitted_pages == 32);
+	assert(!req.installed_pages && zram.stats.bd_writes == 32);
+	assert(submit_count == 1 && nr_completed == 1 && peak_live_bios == 2);
+	assert(zram.bd_wb_limit == 33 * unit);
+	clear_idle(&zram);
+	finish(&zram);
+}
+
+static void invalidate_first_bio(unsigned int serial)
+{
+	if (!serial)
+		invalidate();
+}
+
+static void test_cancel(void)
+{
+	struct zram zram;
+	struct zram_wb_exec req;
+	const u64 unit = 1ULL << (PAGE_SHIFT - 12);
+
+	reset(&zram);
+	candidates(&zram, 65, false);
+	zram.wb_limit_enable = true;
+	zram.bd_wb_limit = 33 * unit;
+	defer_bios = newest_first = true;
+	before_end_io = invalidate_first_bio;
+	req = run_idle(&zram, 65, 65);
+	assert(req.stop_reason == ZRAM_WB_STOP_GLOBAL_LIMIT && req.op_errno == -EIO);
+	assert(req.submitted_pages == 33 && req.installed_pages == 29);
+	assert(req.invalidated_pages == 4 && !zram.bd_wb_limit);
+	assert(submit_count == 2 && completion_order[0] == 1 && completion_order[1] == 0);
+	assert(!zram_allocated(&zram, 0));
+	for (unsigned int i = 1; i <= 3; i++) {
+		assert(!zram_test_flag(&zram, i, ZRAM_WB));
+		assert(zram_test_flag(&zram, i, ZRAM_COMPRESS_LOW));
+		assert(zram_idle_count(&zram, i) == 3 && handles[i + 1]);
+	}
+	for (unsigned int i = 4; i < 65; i++)
+		assert(zram_test_flag(&zram, i, ZRAM_WB) == (i < 33));
+	clear_idle(&zram);
+	finish(&zram);
+}
+
 static void test_store_sizes(void)
 {
 	const unsigned int sizes[] = {1, 31, 32, 33, 65};
@@ -710,6 +890,27 @@ static void interrupt_during_io(void)
 	/* Delivery at the submit scheduling point, not a real host signal. */
 	signal_at = 1;
 }
+static void test_secondary_alloc_failure(void)
+{
+	/* #34 is the second batch, #35 its first page. In either case, wait
+	 * for a usable batch rather than aborting or reusing an empty batch. */
+	for (unsigned int fail = 34; fail <= 35; fail++) {
+		struct zram zram;
+		struct zram_wb_exec req;
+		const unsigned int pages = 4 * 32 + 1;
+
+		reset(&zram);
+		candidates(&zram, pages, false);
+		defer_bios = true;
+		alloc_fail_at = fail;
+		req = run_idle(&zram, pages, pages);
+		assert(!req.op_errno && req.installed_pages == pages);
+		assert(req.submitted_pages == pages && !req.invalidated_pages);
+		assert(submit_count == 5 && nr_completed == 5);
+		finish(&zram);
+	}
+}
+
 static void test_store_faults(void)
 {
 	/* Allocation #1 is batch, #2 first page; later failures allow fallback.
@@ -726,39 +927,43 @@ static void test_store_faults(void)
 		clear_idle(&zram);
 		finish(&zram);
 	}
-	for (unsigned int scenario = 0; scenario < 8; scenario++) {
+	for (unsigned int scenario = 0; scenario < 9; scenario++) {
 		struct zram zram;
+		const u64 unit = 1ULL << (PAGE_SHIFT - 12);
+		u64 before, submitted;
+
 		reset(&zram);
 		candidates(&zram, 65, false);
 		if (scenario == 0) mutex_interrupted = true;
 		if (scenario == 1) signal_at = 5; /* preallocation interrupted */
-		if (scenario == 2) signal_at = 35; /* one pending snapshot */
+		if (scenario == 2) during_resched = interrupt_during_io; /* one snapshot */
 		if (scenario == 3) read_fail_index = 1;
 		if (scenario == 4) io_error = -EIO;
 		if (scenario == 5) add_fail_at = 2;
-		if (scenario >= 6) {
-			zram.wb_limit_enable = true;
-			zram.bd_wb_limit = (scenario == 6 ? 31 : 0) *
-				(1ULL << (PAGE_SHIFT - 12));
-		}
+		if (scenario == 8) interrupt_bio_build = true;
+		zram.wb_limit_enable = true;
+		before = zram.bd_wb_limit = (scenario == 6 ? 31 : scenario == 7 ? 0 : 65) * unit;
 		ssize_t ret = store(&zram, "idle");
-		assert(ret == (scenario <= 2 ? -EINTR : -EIO));
+		assert(ret == (scenario <= 2 || scenario == 8 ? -EINTR : -EIO));
+		submitted = scenario == 4 ? 32 : scenario == 6 ? 31 : 0;
 		assert(zram.stats.bd_count == (scenario == 6 ? 31 : 0));
-		assert(zram.stats.bd_writes == (scenario == 4 ? 32 : scenario == 6 ? 31 : 0));
+		assert(zram.stats.bd_writes == submitted);
+		assert(zram.bd_wb_limit == before - submitted * unit);
 		clear_idle(&zram);
 		finish(&zram);
 	}
-	/* Signal arriving in submit: attempted IO remains charged, no installation. */
+	/* Signal stops new work; successful committed IO still installs on drain. */
 	{
 		struct zram zram;
 		reset(&zram);
 		candidates(&zram, 65, false);
 		zram.wb_limit_enable = true;
 		zram.bd_wb_limit = 65ULL << (PAGE_SHIFT - 12);
+		defer_bios = true;
 		during_io = interrupt_during_io;
 		assert(store(&zram, "idle") == -EINTR);
 		assert(submit_count == 1 && zram.stats.bd_writes == 32);
-		assert(!zram.stats.bd_count);
+		assert(zram.stats.bd_count == 32 && nr_completed == 1);
 		assert(zram.bd_wb_limit == (33ULL << (PAGE_SHIFT - 12)));
 		clear_idle(&zram);
 		finish(&zram);
@@ -1024,7 +1229,7 @@ static void test_exec_faults(void)
 			during_io = interrupt_during_io;
 			stop = ZRAM_WB_STOP_INTERRUPTED;
 			error = -EINTR;
-			submitted = 32;
+			submitted = installed = 32;
 		}
 		if (scenario == 7) {
 			mutex_interrupted = true;
@@ -1379,45 +1584,53 @@ static void test_policy(void)
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
+	assert(!zram_wb_thread); /* Host does not start the kernel thread. */
+	stop_worker = true;
+	assert(!zram_wb_completion_thread(NULL)); /* Idle kthread stop path. */
+	stop_worker = false;
 #ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
-	puts("TAP version 13\n1..14");
+	puts("TAP version 13\n1..15");
 #else
-	puts("TAP version 13\n1..8");
+	puts("TAP version 13\n1..9");
 #endif
 	test_demand();
-	puts("ok - actual demand hysteresis, config/age and lifecycle sequences");
+	puts("ok 1 - actual demand hysteresis, config/age and lifecycle sequences");
 	test_policy();
-	puts("ok - cold policy actual selector, wrapping cursor, scan bound and strict validation");
+	puts("ok 2 - cold policy actual selector, wrapping cursor, scan bound and strict validation");
 	test_budget();
-	puts("ok 1 - extracted reserve/refund budget units and disabled limit");
-	test_flush();
-	puts("ok 2 - extracted flush success/error/partial/BIO failure/signal cleanup");
+	puts("ok 3 - extracted reserve/refund budget units and disabled limit");
+	test_async_window();
+	puts("ok 4 - async inline/deferred/out-of-order completion with a four-BIO window");
 	test_cancel();
-	puts("ok 3 - extracted complete simulated free/rewrite/read/ABA cancellation");
+	puts("ok 5 - deferred short grant, budget charging and free/rewrite/read/ABA invalidation");
+	test_async_failure();
+	test_async_uncommitted();
+	puts("ok 6 - first completion error stops submissions, refunds uncommitted work, and drains");
 	test_store_sizes();
-	puts("ok 4 - extracted store 1/31/32/33/65 pages and logical/backing gaps");
+	puts("ok 7 - extracted store 1/31/32/33/65 pages and logical/backing gaps");
 	test_store_requestmax();
 	test_store_modes();
 	test_store_exclusions();
-	puts("ok 5 - legacy caps/modes/page-index/count boundaries/exclusion guards");
+	puts("ok 8 - legacy caps/modes/page-index/count boundaries/exclusion guards");
 	test_store_faults();
-	puts("ok 6 - extracted store OOM fallback/signal/read/IO/BIO/budget/ENOSPC cleanup");
+	test_secondary_alloc_failure();
+	puts("ok 9 - extracted engine OOM fallback/signal/read/IO/BIO/budget/ENOSPC cleanup");
 #ifdef CONFIG_ZRAM_WRITEBACK_IOCTL
 	test_exec_counts_caps();
 	test_exec_caps_split();
-	puts("ok 7 - dual caps + invalidation + gaps/prealloc-one; disabled quota unchanged");
+	puts("ok 10 - dual caps + invalidation + gaps/prealloc-one; disabled quota unchanged");
 	test_exec_invalidations();
-	puts("ok 8 - install-point counts and single-count submitted/unsubmitted invalidations");
+	puts("ok 11 - install-point counts and single-count submitted/unsubmitted invalidations");
 	test_exec_faults();
 	test_exec_late_io_error();
-	puts("ok 9 - EXEC errors/stages/precedence; second-BIO failure keeps first installs");
+	puts("ok 12 - EXEC errors/stages/precedence; second-BIO failure keeps first installs");
 	test_exec_validation();
-	puts("ok 10 - strict EXEC validation, all reserved/output bytes and permissions");
+	puts("ok 13 - strict EXEC validation, all reserved/output bytes and permissions");
 	test_status_lifecycle();
-	puts("ok 11 - sampled STATUS, read-only access, stale/not-ready/generation/wrap");
+	puts("ok 14 - sampled STATUS, read-only access, stale/not-ready/generation/wrap");
 	test_copyout_compat();
 	test_fops_routing();
-	puts("ok 12 - actual fops native/compat routing and partial copyout; no ID dedup");
+	puts("ok 15 - actual fops native/compat routing and partial copyout; no ID dedup");
 #endif
 	return 0;
 }

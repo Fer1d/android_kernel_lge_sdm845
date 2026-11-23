@@ -9,8 +9,9 @@ Uses temporary build files only. Native execution models an LP64 kernel;
 32-bit zram kernel (whose pre-existing slot flags require separate work).
 Never opens /dev, sysfs, or invokes the device-oriented zram shell tests.
 A missing implementation is KSFT_SKIP (4), not a passing model test.
-Kernel locks, BIOs, allocations and slot state are simulated; this is not
-kernel concurrency, device I/O, or a kernel configuration build test.
+Kernel locks, BIO delivery and wait scheduling are simulated. The extracted
+completion worker step is executed cooperatively; this is not kernel
+concurrency, device I/O, or a kernel configuration build test.
 """
 
 import argparse
@@ -28,7 +29,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[3]
 SOURCE = ROOT / "drivers/block/zram/zram_drv.c"
 REQUIRED = ("zram_wb_reserve", "zram_wb_refund", "zram_wb_complete",
-            "zram_wb_flush")
+            "zram_wb_submit", "zram_wb_end_io", "zram_wb_reap_one",
+            "zram_wb_completion_thread", "zram_wb_drain", "zram_writeback_engine_policy")
 
 
 def masked(text):
@@ -249,9 +251,10 @@ int main(void) {
 def extract(text):
     header = (SOURCE.parent / "zram_drv.h").read_text()
     enum = re.search(r"enum zram_pageflags\s*\{", masked(header))
-    batch = re.search(r"struct zram_wb_batch\s*\{", masked(text))
-    if not enum or not batch:
-        raise ValueError("missing actual flags or batch declaration")
+    scheduler = re.search(r"^#define ZRAM_WB_BATCH_SIZE\s+\d+.*?"
+                          r"(?=^static int zram_writeback_engine\()", text, re.M | re.S)
+    if not enum or not scheduler:
+        raise ValueError("missing actual flags or async scheduler section")
     defines = []
     for name in ("ZRAM_FLAG_SHIFT", "ZRAM_COMP_PRIORITY_MASK",
                  "ZRAM_IDLE_COUNT_SHIFT", "ZRAM_IDLE_COUNT_MAX",
@@ -260,11 +263,7 @@ def extract(text):
         if not match:
             raise ValueError("missing actual constant " + name)
         defines.append(match[0])
-    match = re.search(r"^#define ZRAM_WB_BATCH_SIZE\s+\d+", text, re.M)
-    if not match:
-        raise ValueError("missing actual batch size")
-    declarations = "\n".join(defines + [braced(header, enum.start()) + ";",
-                                         match[0], braced(text, batch.start()) + ";"])
+    declarations = "\n".join(defines + [braced(header, enum.start()) + ";"])
     for name in ("PAGE_WB_SIG", "PAGE_WRITEBACK", "HUGE_WRITEBACK",
                  "IDLE_WRITEBACK", "FILTERED_IDLE_WRITEBACK"):
         match = re.search(r"^#define\s+" + name + r"\s+[^\n]+", text, re.M)
@@ -278,10 +277,12 @@ def extract(text):
                  "zram_clear_flag", "zram_set_element", "zram_get_element",
                  "zram_get_obj_size", "zram_set_obj_size", "zram_set_priority",
                  "zram_allocated", "alloc_block_bdev", "free_block_bdev",
-                 "zram_free_page", "zram_wb_stop") + REQUIRED:
+                 "zram_free_page", "init_done", "dev_to_zram", "writeback_parse_filter",
+                 "zram_writeback_match"):
         functions.append(function(text, name))
-    for name in ("init_done", "dev_to_zram", "writeback_parse_filter",
-                 "zram_writeback_match", "zram_wb_policy_match", "zram_writeback_engine_policy", "zram_writeback_engine", "writeback_store"):
+    # Keep production declarations, helpers, and preprocessor branches in order.
+    functions.append(scheduler[0])
+    for name in ("zram_writeback_engine", "writeback_store"):
         functions.append(function(text, name))
     functions.append(function((SOURCE.parent / "zram_pool_policy.c").read_text(), "zram_wb_policy_validate"))
     functions.append(function((SOURCE.parent / "zram_pool_policy.c").read_text(), "zram_policy_sample"))

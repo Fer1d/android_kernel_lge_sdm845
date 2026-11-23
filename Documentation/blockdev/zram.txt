@@ -387,11 +387,12 @@ a single snapshot of the current setting. Failed or skipped recompression keeps
 the old classification. Disabling the setting therefore does not immediately
 remove old low flags or exclude those old objects from explicit writeback.
 
-Writeback gathers at most 32 pages in request-private buffers, using a
-synchronous BIO only for consecutive backing-device page slots. A backing-slot
-hole, a full batch, the per-request success bound or the end of the scan flushes
-the batch. Memory pressure may reduce the batch size; failure to allocate even
-one buffer returns ENOMEM. Page buffers need not be physically contiguous.
+Writeback gathers up to 32 consecutive backing-device page slots per BIO.
+A backing-slot hole, a full batch, the per-request success bound or the end
+of the scan submits the batch. At most four batches per device may be in
+flight. Memory pressure may reduce the batch size or cause reuse of an earlier
+batch after it completes; failure to allocate even one usable buffer returns
+ENOMEM. Page buffers need not be physically contiguous.
 Requests on the same device are serialized. Reads retain the existing backing
 read path. A slot freed, rewritten, accessed or explicitly marked new during
 collection or I/O is not replaced by that writeback's saved contents.
@@ -399,11 +400,11 @@ collection or I/O is not replaced by that writeback's saved contents.
 The per-request max_pages counts successful installations, not physical I/O
 attempts, and pending pages are included when enforcing that bound. It does not
 replace the device writeback budget described below. A failed BIO (including a
-partially completed BIO) installs none of its pages. An error or pending signal
-cancels unsubmitted pages and releases temporary backing slots; earlier completed
-batches are not rolled back. Signals observed after synchronous I/O also prevent
-installation of that batch. Errors can therefore be returned after physical I/O
-or earlier successful installations.
+partially completed BIO) installs none of its pages. Once an error or signal
+is observed, no more BIOs are committed. Unsubmitted pages are discarded and
+their temporary backing slots released; submitted BIOs are drained. A successful
+BIO may still install pages whose slots remain valid. Errors can therefore be
+returned after physical I/O or successful installations.
 
 If there are lots of write IO with flash device, potentially, it has
 flash wearout problem so that admin needs to design write limitation
@@ -543,7 +544,7 @@ EXEC returns these request-local outputs:
                     per slot; the preselection recheck is not a second scan.
   selected_pages    slots claimed UNDER_WB after the final selection check,
                     including a selection whose snapshot read subsequently fails.
-  submitted_pages   physical pages passed to submit_bio_wait, not BIO count.
+  submitted_pages   physical pages passed to submit_bio, not BIO count.
   installed_pages   increments at each successful slot installation under the
                     slot lock; never a difference of global bd_count samples.
                     A later free of an installed page does not reduce this count.
@@ -564,9 +565,11 @@ EXEC returns these request-local outputs:
 COMPLETE means the scan ended, not that a nonzero installation goal was reached.
 When both per-call caps are reached, INSTALLED_LIMIT takes precedence. Real
 errors/signals/global exhaustion take precedence over ordinary cap/end-of-scan
-reasons, and cleanup does not overwrite the first error, stage or stop cause.
-An IO error is preserved if a signal is also noticed after the same BIO. A
-signal is reported as op_errno=-EINTR, never a restartable syscall result.
+reasons. The first observed BIO error takes precedence over non-I/O stop
+causes. An interruption stops further submissions; already submitted BIOs
+are drained, and successful pages can still be installed if their slots
+remain valid. A signal is reported as op_errno=-EINTR, not a restartable
+syscall result.
 
 All structurally valid EXECs return ioctl 0 after copying their result, even if
 op_errno records stale/not-ready, ENOSPC, ENOMEM, EIO, EINTR or another operation
@@ -578,11 +581,14 @@ there is no refund, internal restart or result recovery API. The caller must not
 automatically replay EXEC or fall back to sysfs after EFAULT or any other EXEC
 failure. STATUS cannot resolve whether a particular request installed pages.
 
-The engine is shared with legacy sysfs, uses the existing synchronous 32-page
-aggregation and init_lock -> wb_mutex -> slot/wb_limit_lock order, and preserves
-the UNDER_WB/IDLE invalidation protocol. There is no new worker, parallel BIO,
-slot-owner system, or sleeping lock in slot-free notification. Old sysfs parsing,
-selection, unlimited-attempt behavior, returns and global-limit behavior remain.
+The engine is shared with legacy sysfs. It aggregates up to 32 contiguous
+backing pages per BIO and keeps at most four batches per device, including any
+batch being prepared. BIO callbacks queue completed batches for one shared
+kernel thread. The thread revalidates slots using the UNDER_WB/IDLE protocol
+and releases resources before the request returns. The caller keeps init_lock
+and wb_mutex held through the drain; the thread takes neither lock. Slot-free
+notification does not acquire a sleeping lock. Sysfs still waits for the whole
+request to finish and retains its parsing, selection and attempt limits.
 
 A new device has a random nonzero instance cookie and generation 1, stored outside
 resettable statistics. Successful backing setup/removal, disk initialization and
@@ -594,7 +600,7 @@ more than one increment (for example reset also removes a backing device); use
 equality, not an expected increment. Generation wrap creates a different random
 nonzero instance cookie and starts at generation 1; device ID reuse also obtains
 a new random cookie. Tokens are lifecycle guards, not security credentials or
-per-slot versions. Exclusive reset waits for the synchronous engine to finish.
+per-slot versions. Exclusive reset waits for the active writeback request to drain.
 
 Host-only actual-source regression targets and their simulation limits are
 listed in tools/testing/selftests/zram/README. Passing them is not a full kernel
